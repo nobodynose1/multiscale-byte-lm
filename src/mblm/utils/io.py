@@ -23,6 +23,7 @@ SOFTWARE."""
 import csv
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Generic, Iterable, NamedTuple, TypeAlias, TypeVar
 
@@ -161,6 +162,22 @@ def read_jsonl(
 StateDict: TypeAlias = dict[str, Any]
 
 
+def atomic_torch_save(snapshot: StateDict, file: str | Path) -> Path:
+    """
+    Atomically save a torch checkpoint by writing a sibling temp file first.
+    """
+    file = _to_path(file)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = file.with_name(f".{file.name}.{os.getpid()}.tmp")
+    try:
+        torch_save(snapshot, tmp_file)
+        tmp_file.replace(file)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink()
+    return file
+
+
 def save_model_state(
     dir: str | Path,
     checkpoint_name: str,
@@ -187,11 +204,138 @@ def save_model_state(
         model = model.state_dict()
     did_overwrite = file.exists()
     snapshot = {"MODEL": model, "LOSS": loss}
-    torch_save(snapshot, file)
+    atomic_torch_save(snapshot, file)
     return did_overwrite, file
 
 
 _TModule = TypeVar("_TModule", bound=TorchModule)
+
+
+def _state_dict_or_none(obj: Any | None) -> StateDict | None:
+    if obj is None:
+        return None
+    return obj.state_dict()
+
+
+def save_training_checkpoint_state(
+    dir: str | Path,
+    checkpoint_name: str,
+    *,
+    model: TorchModule | StateDict,
+    loss: float,
+    optimizer: Any | None = None,
+    scheduler: Any | None = None,
+    grad_scaler: Any | None = None,
+    epoch: int,
+    batch: int,
+    cum_batch: int,
+) -> tuple[bool, Path]:
+    """
+    Save a full training checkpoint suitable for exact interruption resume.
+    """
+    path = _to_path(dir)
+    path.mkdir(parents=True, exist_ok=True)
+    file = path.joinpath(checkpoint_name).with_suffix(".pth")
+
+    if isinstance(model, TorchModule):
+        model = model.state_dict()
+
+    snapshot = {
+        "MODEL": model,
+        "LOSS": loss,
+        "OPTIMIZER": _state_dict_or_none(optimizer),
+        "SCHEDULER": _state_dict_or_none(scheduler),
+        "GRAD_SCALER": _state_dict_or_none(grad_scaler),
+        "EPOCH": epoch,
+        "BATCH": batch,
+        "CUM_BATCH": cum_batch,
+    }
+    did_overwrite = file.exists()
+    atomic_torch_save(snapshot, file)
+    return did_overwrite, file
+
+
+def load_checkpoint_snapshot(
+    checkpoint_file: str | Path,
+    map_location: MAP_LOCATION | None = None,
+) -> StateDict:
+    return torch_load(
+        checkpoint_file,
+        map_location=map_location,
+        weights_only=True,
+    )
+
+
+def _move_optimizer_state_to_device(optimizer: Any, device: str) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def restore_training_component_states(
+    snapshot: StateDict,
+    *,
+    optimizer: Any | None = None,
+    scheduler: Any | None = None,
+    grad_scaler: Any | None = None,
+    optimizer_device: str | None = None,
+) -> None:
+    if optimizer and snapshot.get("OPTIMIZER") is not None:
+        optimizer.load_state_dict(snapshot["OPTIMIZER"])
+        if optimizer_device:
+            _move_optimizer_state_to_device(optimizer, optimizer_device)
+    if scheduler and snapshot.get("SCHEDULER") is not None:
+        scheduler.load_state_dict(snapshot["SCHEDULER"])
+    if grad_scaler and snapshot.get("GRAD_SCALER") is not None:
+        grad_scaler.load_state_dict(snapshot["GRAD_SCALER"])
+
+
+@torch.no_grad()
+def load_training_checkpoint_state(
+    checkpoint_file: str | Path,
+    model: _TModule,
+    *,
+    optimizer: Any | None = None,
+    scheduler: Any | None = None,
+    grad_scaler: Any | None = None,
+    map_location: MAP_LOCATION | None = None,
+    optimizer_device: str | None = None,
+    map_extend_embeddings: set[str] | None = None,
+    map_rename_modules: Iterable[tuple[str, str]] | None = None,
+    on_success: Callable[[str], Any] | None = None,
+) -> tuple[_TModule, float, StateDict]:
+    """
+    Restore a model and, when present, optimizer/scheduler/scaler state.
+    """
+    snapshot = load_checkpoint_snapshot(checkpoint_file, map_location=map_location)
+    state_dict = snapshot["MODEL"]
+    loss = snapshot["LOSS"]
+
+    def _notify(msg: str):
+        if on_success:
+            on_success(msg)
+
+    if map_rename_modules:
+        state_dict = _modules_map_rename(state_dict, map_rename_modules, notify=_notify)
+    if map_extend_embeddings:
+        state_dict = _embedding_map_extend(
+            state_dict,
+            model.state_dict(),
+            map_extend_embeddings,
+            notify=_notify,
+        )
+    model.load_state_dict(state_dict, strict=True)
+
+    restore_training_component_states(
+        snapshot,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        grad_scaler=grad_scaler,
+        optimizer_device=optimizer_device,
+    )
+
+    return model, loss, snapshot
 
 
 def _embedding_map_extend(
@@ -253,7 +397,7 @@ def _modules_map_rename(
                 postfix = src_module_name[len(rename_from_refix) :]
                 tgt_module_name = rename_to_prefix + postfix
                 src_state_updated[tgt_module_name] = data
-                notify(f"Successfully renamed {src_module_name +postfix } to {tgt_module_name}")
+                notify(f"Successfully renamed {src_module_name + postfix} to {tgt_module_name}")
     return src_state_updated
 
 
@@ -284,26 +428,12 @@ def load_model_state(
         tuple: A tuple with the original model `T` with
             `updated state_dict` and the associated loss
     """
-    snapshot = torch_load(
+    model, loss, _ = load_training_checkpoint_state(
         checkpoint_file,
-        map_location,
-        weights_only=True,
+        model,
+        map_location=map_location,
+        map_extend_embeddings=map_extend_embeddings,
+        map_rename_modules=map_rename_modules,
+        on_success=on_success,
     )
-    state_dict = snapshot["MODEL"]
-    loss = snapshot["LOSS"]
-
-    def _notify(msg: str):
-        if on_success:
-            on_success(msg)
-
-    if map_rename_modules:
-        state_dict = _modules_map_rename(state_dict, map_rename_modules, notify=_notify)
-    if map_extend_embeddings:
-        state_dict = _embedding_map_extend(
-            state_dict,
-            model.state_dict(),
-            map_extend_embeddings,
-            notify=_notify,
-        )
-    model.load_state_dict(state_dict, strict=True)
     return model, loss

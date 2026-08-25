@@ -20,6 +20,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
+import json
 import logging
 import math
 import sys
@@ -32,6 +33,7 @@ from typing import Any, Generic, Iterable, Iterator, Literal, Sequence, TypeVar,
 
 import torch
 import torch.distributed as dist
+import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer  # type: ignore
 from torch.optim.lr_scheduler import LRScheduler
@@ -60,8 +62,10 @@ from mblm.utils.io import (
     CSVWriter,
     StateDict,
     dump_yml,
-    load_model_state,
+    load_training_checkpoint_state,
+    restore_training_component_states,
     save_model_state,
+    save_training_checkpoint_state,
 )
 from mblm.utils.logging import create_logger
 from mblm.utils.misc import retry
@@ -127,6 +131,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     _csv_loss_writer: CSVWriter[CSVLossEntry]
     _csv_timemem_writer: CSVWriter[CSVTimeAndMemSnapshotEntry]
     _log: logging.Logger
+    _resume_training_snapshot: StateDict | None
+    _auto_resume_latest_path: Path | None
+    _last_latest_checkpoint_step: int
+    _last_latest_checkpoint_time: float
 
     def __init__(
         self,
@@ -136,6 +144,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     ):
         self.config = config
         self.options = options or CoreTrainerOptions()
+        self._auto_resume_latest_path = self._configure_auto_resume_latest()
+        self._resume_training_snapshot = None
+        self._last_latest_checkpoint_step = 0
+        self._last_latest_checkpoint_time = time()
         self._world_size = run_vars.world_size
         self._local_rank = run_vars.local_rank
         # used for sending tensors/models to a device
@@ -185,10 +197,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             map_rename_modules = (
                 self.rename_modules_if_enabled() if config.resume.rename_modules else None
             )
-            model, model_loss = load_model_state(
+            model, model_loss, self._resume_training_snapshot = load_training_checkpoint_state(
                 config.resume.checkpoint_file,
                 model,
-                map_location=self._device,
+                map_location="cpu",
                 map_extend_embeddings=map_extend_embeddings,
                 map_rename_modules=map_rename_modules,
                 on_success=self._log.debug,
@@ -197,7 +209,12 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             # model from the previous run should we only make everything worse
             # during this training
             self._top_n_models.add((model_loss, model.state_dict()))
+            self._resume_training_snapshot.pop("MODEL", None)
             self._log.info(f"Loaded model with loss {model_loss:.4f} from checkpoint")
+            if self._auto_resume_latest_path:
+                self._log.info(
+                    f"Auto-resuming from latest checkpoint: {self._auto_resume_latest_path}"
+                )
         else:
             self._log.info("Creating new model")
 
@@ -226,6 +243,63 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._log.info(f"Model parameters: {main_model_params}, ({submodule_params})")
         self._log.info(f"Configuration: {config}")
         self._log.info(f"CUDA: {cuda_info}")
+
+    def _configure_auto_resume_latest(self) -> Path | None:
+        if self.config.resume or not self.config.train.auto_resume_latest:
+            return None
+
+        output_root = Path(self.config.io.output_dir)
+        if not output_root.is_dir():
+            return None
+
+        candidates: list[tuple[float, Path, Path, dict[str, Any]]] = []
+        for run_dir in output_root.glob(f"{self.config.io.name_model}_*"):
+            latest_path = run_dir / self.config.train.latest_checkpoint_name
+            config_path = run_dir / self.options.config_file_name
+            if not latest_path.is_file() or not config_path.is_file():
+                continue
+            try:
+                with config_path.open("r", encoding="utf-8") as file:
+                    saved_config = yaml.safe_load(file) or {}
+            except OSError:
+                continue
+            if not self._saved_config_is_resume_compatible(saved_config):
+                continue
+            resume_conf = saved_config.get("resume") or {}
+            if resume_conf.get("next_epoch_index") is None:
+                continue
+            if resume_conf.get("next_batch_index") is None:
+                continue
+            candidates.append((latest_path.stat().st_mtime, latest_path, config_path, resume_conf))
+
+        if not candidates:
+            return None
+
+        _, latest_path, config_path, resume_conf = max(
+            candidates, key=lambda candidate: candidate[0]
+        )
+        self.config.resume = ResumeConfig(
+            checkpoint_file=str(latest_path),
+            next_epoch_index=int(resume_conf["next_epoch_index"]),
+            next_batch_index=int(resume_conf["next_batch_index"]),
+            migrate_embeddings=bool(resume_conf.get("migrate_embeddings", False)),
+            rename_modules=bool(resume_conf.get("rename_modules", False)),
+            resumed_from=str(config_path),
+        )
+        return latest_path
+
+    def _saved_config_is_resume_compatible(self, saved_config: dict[str, Any]) -> bool:
+        saved_io = saved_config.get("io") or {}
+        saved_params = saved_config.get("params")
+        return saved_io.get(
+            "name_model"
+        ) == self.config.io.name_model and self._normalise_config_fragment(
+            saved_params
+        ) == self._normalise_config_fragment(self.config.params.model_dump(mode="json"))
+
+    @staticmethod
+    def _normalise_config_fragment(value: Any) -> Any:
+        return json.loads(json.dumps(value, sort_keys=True, default=str))
 
     """ Abstract methods that must be implemented """
 
@@ -511,6 +585,84 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
         return log_train_loss_idxs, run_valid_interval_idxs
 
+    def _save_latest_checkpoint(
+        self,
+        *,
+        optimizer: Optimizer,
+        scheduler: LRScheduler,
+        grad_scaler: torch.GradScaler,
+        loss: float,
+        next_batch_idx: int,
+        next_epoch: int,
+        next_cumulative_batch_idx: int,
+    ) -> None:
+        if not self.config.train.latest_checkpoint_enabled:
+            return
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        if not self._is_main_worker:
+            return
+
+        original_model = self._unpack_distributed_model(self._model_dist)
+        _, latest_model_path = save_training_checkpoint_state(
+            self._output_dir,
+            self.config.train.latest_checkpoint_name,
+            model=original_model,
+            loss=loss,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            grad_scaler=grad_scaler,
+            epoch=next_epoch,
+            batch=next_batch_idx,
+            cum_batch=next_cumulative_batch_idx,
+        )
+
+        self._running_resume_conf.next_batch_index = next_batch_idx
+        self._running_resume_conf.next_epoch_index = next_epoch
+        self._running_resume_conf.checkpoint_file = str(latest_model_path)
+        self._dump_output_config()
+        self._log.debug(
+            f"Saved latest training state at epoch {next_epoch}, batch {next_batch_idx}"
+        )
+
+    def _maybe_save_latest_checkpoint(
+        self,
+        *,
+        optimizer: Optimizer,
+        scheduler: LRScheduler,
+        grad_scaler: torch.GradScaler,
+        loss: float,
+        next_batch_idx: int,
+        next_epoch: int,
+        next_cumulative_batch_idx: int,
+        completed_optimizer_steps: int,
+    ) -> None:
+        if not self.config.train.latest_checkpoint_enabled:
+            return
+
+        now = time()
+        steps_elapsed = completed_optimizer_steps - self._last_latest_checkpoint_step
+        seconds_elapsed = now - self._last_latest_checkpoint_time
+        due_by_steps = steps_elapsed >= self.config.train.latest_checkpoint_interval_steps
+        due_by_time = (
+            self.config.train.latest_checkpoint_interval_seconds is not None
+            and seconds_elapsed >= self.config.train.latest_checkpoint_interval_seconds
+        )
+        if not due_by_steps and not due_by_time:
+            return
+
+        self._save_latest_checkpoint(
+            optimizer=optimizer,
+            scheduler=scheduler,
+            grad_scaler=grad_scaler,
+            loss=loss,
+            next_batch_idx=next_batch_idx,
+            next_epoch=next_epoch,
+            next_cumulative_batch_idx=next_cumulative_batch_idx,
+        )
+        self._last_latest_checkpoint_step = completed_optimizer_steps
+        self._last_latest_checkpoint_time = now
+
     def _save_training_state(self, batch_i: int, epoch: int):
         if not self._is_main_worker:
             return
@@ -519,10 +671,11 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             f"Saved {num_written} best model(s) (overwrote {num_overwritten})",
         )
 
-        # mutate running config in place, then save back
-        self._running_resume_conf.next_batch_index = batch_i
-        self._running_resume_conf.next_epoch_index = epoch
-        self._running_resume_conf.checkpoint_file = str(best_model_path)
+        if not self.config.train.latest_checkpoint_enabled:
+            # mutate running config in place, then save back
+            self._running_resume_conf.next_batch_index = batch_i
+            self._running_resume_conf.next_epoch_index = epoch
+            self._running_resume_conf.checkpoint_file = str(best_model_path)
 
         self._dump_output_config()
         self._log.debug(f"Saved training state at epoch {epoch}, batch {batch_i}")
@@ -784,28 +937,70 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._log_cuda_memory_snapshot(None)
 
         cumulative_batch_idx_start = len(train_loader) * epoch + epoch_batch_idx
+        if cumulative_batch_idx_start > local_batch_iters:
+            self._log.warning(
+                f"Resume position {cumulative_batch_idx_start} exceeds target "
+                f"iterations {local_batch_iters}; no further training will run"
+            )
+        remaining_batch_iters = max(local_batch_iters - cumulative_batch_idx_start, 0)
+        self._log.info(f"Remaining batch iterations: {remaining_batch_iters}")
         global_log_train_idxs, global_run_valid_idxs = self._calc_logging_points(
             local_batch_iters,
-            start_batch_idx=cumulative_batch_idx_start,
+            start_batch_idx=0,
         )
+        global_log_train_idxs = {
+            idx for idx in global_log_train_idxs if idx >= cumulative_batch_idx_start
+        }
+        global_run_valid_idxs = {
+            idx for idx in global_run_valid_idxs if idx >= cumulative_batch_idx_start
+        }
 
         def before_new_epoch(epoch: int) -> None:
             self._log.info(f"Initializing epoch {epoch}")
             train_dataset.offset_to(epoch)
 
         gradient_scaler = torch.GradScaler(device=self._device_type)
+        if self.config.resume and self._resume_training_snapshot:
+            has_training_state = any(
+                self._resume_training_snapshot.get(key) is not None
+                for key in ("OPTIMIZER", "SCHEDULER", "GRAD_SCALER")
+            )
+            restore_training_component_states(
+                self._resume_training_snapshot,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                grad_scaler=gradient_scaler,
+                optimizer_device=self._device,
+            )
+            if has_training_state:
+                self._log.info(
+                    "Restored optimizer/scheduler/scaler from checkpoint: "
+                    f"{self.config.resume.checkpoint_file}"
+                )
+            else:
+                self._log.warning(
+                    "Resume checkpoint has no optimizer/scheduler/scaler state; "
+                    "resuming model weights only."
+                )
+            self._resume_training_snapshot = None
 
         # total elements seen during trainings
-        elements_seen_total = 0
+        elements_seen_total = elements_per_batch * cumulative_batch_idx_start
         curr_avg_grad: float = -1
         curr_avg_grad_clipped: float = -1
+        completed_optimizer_steps = (
+            cumulative_batch_idx_start // train_conf.gradient_accumulate_every
+        )
+        self._last_latest_checkpoint_step = completed_optimizer_steps
+        self._last_latest_checkpoint_time = time()
+        last_successful_optimizer_step: tuple[int, int, int, float] | None = None
         for iteration in tqdm(
             epoch_cycler(
                 train_loader,
                 before_new_epoch=before_new_epoch,
                 start_epoch=epoch,
                 start_batch=epoch_batch_idx,
-                max_iters=local_batch_iters,
+                max_iters=remaining_batch_iters,
             ),
             desc="Training",
             mininterval=self.options.train_prog_min_interval_seconds,
@@ -918,6 +1113,25 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                 if scheduler and not skip_lr_sched:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if not skip_lr_sched:
+                    completed_optimizer_steps += 1
+                    next_cumulative_batch_idx = len(train_loader) * next_epoch + next_batch_idx
+                    last_successful_optimizer_step = (
+                        next_epoch,
+                        next_batch_idx,
+                        next_cumulative_batch_idx,
+                        train_loss_as_flt,
+                    )
+                    self._maybe_save_latest_checkpoint(
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        grad_scaler=gradient_scaler,
+                        loss=train_loss_as_flt,
+                        next_batch_idx=next_batch_idx,
+                        next_epoch=next_epoch,
+                        next_cumulative_batch_idx=next_cumulative_batch_idx,
+                        completed_optimizer_steps=completed_optimizer_steps,
+                    )
 
             # before evaluation, we do not perform a gradient update. hence, the
             # "elements_seen_total" we log below might be slightly off.
@@ -961,13 +1175,29 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
         else:
             # we have seen exactly local_batch_iters batches
-            elements_match = elements_seen_total == expected_local_elements
+            elements_match = (
+                elements_seen_total == expected_local_elements
+                or cumulative_batch_idx_start >= local_batch_iters
+            )
             if not elements_match:
                 self._log.fatal(
                     f"Mismatch between expected and actual elements seen: {expected_local_elements}, {elements_seen_total}"
                 )
             self._log.info("Finished training")
             self._log.info(f"Stats (local): Elements seen: {elements_seen_total}")
+            if last_successful_optimizer_step:
+                next_epoch, next_batch_idx, next_cumulative_batch_idx, loss = (
+                    last_successful_optimizer_step
+                )
+                self._save_latest_checkpoint(
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    grad_scaler=gradient_scaler,
+                    loss=loss,
+                    next_batch_idx=next_batch_idx,
+                    next_epoch=next_epoch,
+                    next_cumulative_batch_idx=next_cumulative_batch_idx,
+                )
 
         best_model = self._unpack_distributed_model(self._model_dist)
 

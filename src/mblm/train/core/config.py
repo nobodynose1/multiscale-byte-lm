@@ -77,6 +77,28 @@ class CoreTrainConfig(BaseModel):
     gradient_accumulate_every: int = Field(
         description="After how many batches to accumulate the gradient"
     )
+    latest_checkpoint_enabled: bool = Field(
+        default=True,
+        description="Write a latest checkpoint for interruption-safe training resume",
+    )
+    auto_resume_latest: bool = Field(
+        default=True,
+        description="When no explicit resume is configured, resume from the newest compatible latest checkpoint",
+    )
+    latest_checkpoint_interval_steps: int = Field(
+        default=100,
+        ge=1,
+        description="Save latest checkpoint after this many successful optimizer steps",
+    )
+    latest_checkpoint_interval_seconds: int | None = Field(
+        default=1800,
+        ge=1,
+        description="Save latest checkpoint after this many seconds, in addition to the step interval",
+    )
+    latest_checkpoint_name: str = Field(
+        default="latest.pth",
+        description="File name for interruption-safe latest checkpoints",
+    )
 
 
 class TrainMaskedConfig(CoreTrainConfig):
