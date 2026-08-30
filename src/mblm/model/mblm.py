@@ -20,7 +20,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
-import logging
 import math
 import typing
 from functools import partial
@@ -552,6 +551,7 @@ class MBLM(nn.Module):
         # L)
         preds = rearrange(logits_rearranged, "b l v -> b v l")
         targets = rearrange(input_ids, "b ... -> b (...)")
+        valid_loss_mask = targets != self.pad_token_id
 
         # same shape as targets with 0 everywhere where the token equals the pad
         # token. this assumes the same pad token is used for intra-batch padding
@@ -567,22 +567,27 @@ class MBLM(nn.Module):
         # remove the hierarchy padding (ignored in the loss calculation) and
         # bring to same shape as input_ids
         loss_tensor = loss_tensor[:, :flat_seq_len]
+        valid_loss_mask = valid_loss_mask[:, :flat_seq_len]
 
         if loss_mask is not None:
             # potentially apply the loss mask. this does not involve
             # broadcasting as after slicing above, the loss mask and the loss tensor
             # have the exact same shape again
             loss_tensor *= loss_mask
+            valid_loss_mask &= loss_mask != 0
 
-        # after applying the loss mask, some elements might be 0 - they should not be
-        # accounted for in the loss calculation
-        nonzero_idxs = torch.nonzero(loss_tensor, as_tuple=True)
-        loss = loss_tensor[nonzero_idxs].mean()
-        if torch.isnan(loss):
-            # special case when the loss is zero across target elements - should
-            # theoretically never happen
-            logging.fatal("Edge case detected, loss is nan")
-            loss = torch.zeros_like(loss, requires_grad=True)
+        # Keep true zero cross-entropy values; only padding and explicit masks are excluded.
+        valid_losses = loss_tensor[valid_loss_mask]
+        if valid_losses.numel() == 0:
+            raise FloatingPointError("No valid loss elements after applying masks")
+        else:
+            finite_losses = torch.isfinite(valid_losses)
+            if not finite_losses.all():
+                non_finite_count = valid_losses.numel() - finite_losses.sum().item()
+                raise FloatingPointError(
+                    f"Non-finite loss elements detected: {non_finite_count}/{valid_losses.numel()}"
+                )
+            loss = valid_losses.mean()
 
         if return_type == MBLMReturnType.LOSS:
             return loss
@@ -1111,6 +1116,7 @@ class MBLMEncoder(nn.Module):
 
         # Ignore where the attention_mask is set to no attention, these are padding tokens.
         targets[~attention_mask] = -100
+        valid_loss_mask = targets != -100
         loss_tensor: torch.Tensor = F.cross_entropy(
             preds,
             targets,  # type: ignore
@@ -1128,16 +1134,20 @@ class MBLMEncoder(nn.Module):
             # have the exact same shape again
 
             loss_tensor *= loss_mask
+            valid_loss_mask &= loss_mask != 0
 
-        # after applying the mask, some elements might be 0 - they should not be
-        # accounted for in the loss calculation
-        nonzero_idxs = torch.nonzero(loss_tensor, as_tuple=True)
-        loss = loss_tensor[nonzero_idxs].mean()
-        if torch.isnan(loss):
-            # special case when the loss is zero across target elements - should
-            # theoretically never happen, except if you mask the whole sequence is ignored
-            loss = torch.zeros_like(loss, requires_grad=True)
-            logging.fatal("Edge case detected, loss is nan")
+        # Keep true zero cross-entropy values; only padding and explicit masks are excluded.
+        valid_losses = loss_tensor[valid_loss_mask]
+        if valid_losses.numel() == 0:
+            raise FloatingPointError("No valid loss elements after applying masks")
+        else:
+            finite_losses = torch.isfinite(valid_losses)
+            if not finite_losses.all():
+                non_finite_count = valid_losses.numel() - finite_losses.sum().item()
+                raise FloatingPointError(
+                    f"Non-finite loss elements detected: {non_finite_count}/{valid_losses.numel()}"
+                )
+            loss = valid_losses.mean()
 
         if return_type == MBLMReturnType.LOSS:
             return loss
