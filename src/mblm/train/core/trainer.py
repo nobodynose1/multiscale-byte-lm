@@ -58,6 +58,7 @@ from mblm.train.core.iter import epoch_cycler
 from mblm.train.core.startup import (
     EVAL_COMPLETE,
     EVAL_ERROR,
+    EVAL_INCOMPLETE,
     EVAL_RESUME,
     EVAL_SCHEDULED,
     EVAL_TEST,
@@ -91,6 +92,11 @@ SOURCE_TRAIN = "train"
 # delivered state to the test row's audit trail and is an input to nothing else
 DELIVERY_TOPN_BEST = "topn/best"
 DELIVERY_FINAL_UNRANKED = "final/unranked"
+
+# a pass that cannot score more than this share of its batches is reading a
+# systematically corrupt dataset, not a few bad samples, and fails instead of
+# reporting a loss over what is left of it
+MAX_EVAL_SKIP_RATE = 0.10
 
 TModel = TypeVar("TModel", bound=torch.nn.Module)
 TBatch = TypeVar("TBatch", bound=torch.Tensor | Sequence[torch.Tensor])
@@ -764,13 +770,18 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
         The outcome reports what this rank actually evaluated: the loss is the
         mean over the batches that succeeded, and the ranks reduce their sums
-        into the one value the run records. A batch that raises does not leave a
-        rank behind in the collective - the pass becomes an error outcome, all
+        into the one value the run records. A batch whose forward pass cannot
+        score it - `FloatingPointError` is the one failure the evaluation side
+        treats as bad data rather than as a bug - is skipped, and a pass that
+        skipped is `incomplete`: recorded, but not comparable with a complete
+        one. Anything else, including a pass that skipped too much of its data,
+        becomes an error outcome. No rank leaves the collective behind - all
         ranks join it, and all of them exit together.
         """
         model.eval()
         loss_sum = 0.0
         ok_batches = 0
+        skipped_batches = 0
         time_taken = 0.0
         target_iters = (
             min(self.config.train.max_eval_steps, len(loader))
@@ -796,11 +807,22 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                 ):
                     with torch.inference_mode():
                         start_eval = time()
-                        loss_tensor = self.model_forward(
-                            cast(TModel, model),
-                            batch=batch,
-                            device=self._device,
-                        )
+                        try:
+                            loss_tensor = self.model_forward(
+                                cast(TModel, model),
+                                batch=batch,
+                                device=self._device,
+                            )
+                        except FloatingPointError as error:
+                            # only the forward pass of one batch may be skipped:
+                            # the failure is read as a batch the model cannot
+                            # score, everything around this call stays fatal
+                            skipped_batches += 1
+                            self._log.warning(
+                                f"Skipping batch {it} of evaluation '{stage}': "
+                                f"{type(error).__name__}: {error}"
+                            )
+                            continue
                         eval_time = time() - start_eval
                         loss_sum += float(loss_tensor.item())
                         ok_batches += 1
@@ -824,6 +846,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                     bw_time=None,
                     num_items=items_seen_so_far,
                 )
+            attempted_batches = ok_batches + skipped_batches
             if ok_batches == 0:
                 # a pass that evaluated nothing has no loss to report, and a
                 # made-up one would be worse than none
@@ -832,14 +855,23 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                     state=EVAL_ERROR,
                     reason="no batch of the evaluation succeeded",
                 )
-            else:
-                # an evaluation that skipped no batch is complete; a pass with
-                # skips is `incomplete` once the boundary can skip a batch at all
+            elif skipped_batches / attempted_batches > MAX_EVAL_SKIP_RATE:
                 local = EvalOutcome(
                     stage=stage,
-                    state=EVAL_COMPLETE,
+                    state=EVAL_ERROR,
+                    reason=f"skipped {skipped_batches} of {attempted_batches} batches, more than "
+                    f"the {MAX_EVAL_SKIP_RATE:.0%} a pass may skip",
+                )
+            else:
+                # an evaluation that skipped no batch is complete; one that
+                # skipped is incomplete, and only complete passes are comparable
+                # with a complete one
+                local = EvalOutcome(
+                    stage=stage,
+                    state=EVAL_INCOMPLETE if skipped_batches else EVAL_COMPLETE,
                     loss_sum=loss_sum,
                     ok_batches=ok_batches,
+                    skipped_batches=skipped_batches,
                 )
 
         return unify_eval_outcome(local, world_size=self._world_size)
