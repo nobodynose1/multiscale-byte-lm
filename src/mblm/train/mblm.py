@@ -48,6 +48,7 @@ from mblm.train.core.config import (
     GenericOutputConfig,
     TrainMaskedConfig,
 )
+from mblm.train.core.startup import required_stage
 from mblm.train.core.trainer import CoreTrainer
 from mblm.utils.distributed import process_group
 from mblm.utils.logging import create_logger, shutdown_log_handlers
@@ -294,6 +295,8 @@ masked_dataset_registry.register("pg19masked")(PG19Masked)
 dataset_registry.register("pg19")(PG19)
 dataset_registry.register("clevr")(Clevr)
 
+_DATASET_STAGE = "datasets"
+
 
 def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
     log = create_logger(__name__, log_dir=config.io.output_dir)
@@ -303,19 +306,20 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
             effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
             if effective_seed is not None:
                 log.info(f"Effective seed: {effective_seed}")
-            dataset = masked_dataset_registry.retrieve(config.io.dataset_id)
-            train_dataset = dataset.from_train_entry_config(
-                config=config,
-                mode=ModelMode.TRAIN,
-                worker_id=run_vars.local_rank,
-                num_workers=run_vars.world_size,
-            )
-            eval_dataset = dataset.from_train_entry_config(
-                config=config,
-                mode=ModelMode.VALID,
-                worker_id=0,
-                num_workers=1,
-            )
+            with required_stage(_DATASET_STAGE, world_size=run_vars.world_size):
+                dataset = masked_dataset_registry.retrieve(config.io.dataset_id)
+                train_dataset = dataset.from_train_entry_config(
+                    config=config,
+                    mode=ModelMode.TRAIN,
+                    worker_id=run_vars.local_rank,
+                    num_workers=run_vars.world_size,
+                )
+                eval_dataset = dataset.from_train_entry_config(
+                    config=config,
+                    mode=ModelMode.VALID,
+                    worker_id=0,
+                    num_workers=1,
+                )
             trainer = MaskedTrainer(config, run_vars=run_vars)
             if torch.distributed.get_rank() == 0:
                 write_mamba_impl_marker(trainer.output_dir, admission)
@@ -340,20 +344,21 @@ def train_mblm(config: TrainEntryConfig) -> None:
             effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
             if effective_seed is not None:
                 log.info(f"Effective seed: {effective_seed}")
-            dataset = dataset_registry.retrieve(config.io.dataset_id)
+            with required_stage(_DATASET_STAGE, world_size=run_vars.world_size):
+                dataset = dataset_registry.retrieve(config.io.dataset_id)
 
-            train_dataset = dataset.from_train_entry_config(
-                config,
-                mode=ModelMode.TRAIN,
-                worker_id=run_vars.local_rank,
-                num_workers=run_vars.world_size,
-            )
-            valid_dataset = dataset.from_train_entry_config(
-                config,
-                mode=ModelMode.VALID,
-                worker_id=0,
-                num_workers=1,
-            )
+                train_dataset = dataset.from_train_entry_config(
+                    config,
+                    mode=ModelMode.TRAIN,
+                    worker_id=run_vars.local_rank,
+                    num_workers=run_vars.world_size,
+                )
+                valid_dataset = dataset.from_train_entry_config(
+                    config,
+                    mode=ModelMode.VALID,
+                    worker_id=0,
+                    num_workers=1,
+                )
 
             trainer = MegabyteTrainer(config, run_vars=run_vars)
             if torch.distributed.get_rank() == 0:
