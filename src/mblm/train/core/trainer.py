@@ -55,7 +55,19 @@ from mblm.train.core.config import (
     TTrainConfig,
 )
 from mblm.train.core.iter import epoch_cycler
-from mblm.train.core.startup import STAGE_CHECKPOINT_SAVE, bootstrap_log, required_stage
+from mblm.train.core.startup import (
+    EVAL_COMPLETE,
+    EVAL_ERROR,
+    EVAL_RESUME,
+    EVAL_SCHEDULED,
+    EVAL_TEST,
+    STAGE_CHECKPOINT_SAVE,
+    STAGE_DELIVERY,
+    EvalOutcome,
+    bootstrap_log,
+    required_stage,
+    unify_eval_outcome,
+)
 from mblm.utils.cuda import IS_BF16_AVAILABLE, cuda_memory_snapshot, cuda_properties
 from mblm.utils.distributed import ElasticRunVars
 from mblm.utils.io import (
@@ -72,6 +84,13 @@ from mblm.utils.top_n import TopN
 
 FRESH = "fresh"
 RESUME = "resume"
+
+# the audit source of a training loss row
+SOURCE_TRAIN = "train"
+# the two states a run can deliver to the test pass; the marker describes the
+# delivered state to the test row's audit trail and is an input to nothing else
+DELIVERY_TOPN_BEST = "topn/best"
+DELIVERY_FINAL_UNRANKED = "final/unranked"
 
 TModel = TypeVar("TModel", bound=torch.nn.Module)
 TBatch = TypeVar("TBatch", bound=torch.Tensor | Sequence[torch.Tensor])
@@ -142,6 +161,9 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     _resume_cursor: CheckpointCursor | None
     _last_latest_checkpoint_step: int
     _last_latest_checkpoint_time: float
+    _was_resumed: bool
+    _topn_has_validated_entry: bool
+    _delivery_source: str | None
 
     def __init__(
         self,
@@ -180,6 +202,12 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             config.io.num_models_to_save,
             deep_copy=True,  # module state_dicts are references
         )
+        # the board only ever holds validation-side numbers: a restored model
+        # enters it through the re-evaluation the resumed run performs, never
+        # through the checkpoint's training-side loss
+        self._was_resumed = False
+        self._topn_has_validated_entry = False
+        self._delivery_source = None
 
     """ Startup stages """
 
@@ -252,15 +280,12 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         )
         # the checkpoint carries the training position in full training state
         self._resume_cursor = cursor
-        if model_loss is None:
-            self._log.warning(
-                f"Checkpoint {checkpoint_file} carries no loss, so nothing is added to "
-                "the model candidate board from it"
-            )
-        else:
-            # keep the restored model as a candidate so a run that only makes
-            # things worse does not lose the model it started from
-            self._top_n_models.add((model_loss, self._model.state_dict()))
+        self._was_resumed = True
+        if model_loss is not None:
+            # the loss a checkpoint was saved with is a training-side number, so
+            # it is recorded for the audit trail but never enters the model
+            # candidate board: the restored model is a candidate only through
+            # the validation-side re-evaluation a resumed run performs
             self._log.info(f"Loaded model with loss {model_loss:.4f} from checkpoint")
         self._log.info(
             f"Resuming from epoch {cursor.epoch}, batch {cursor.batch}, "
@@ -519,6 +544,9 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         lr: float,
         avg_grad: float,
         avg_grad_clipped: float,
+        complete: bool,
+        skipped_batches: int,
+        source: str,
     ) -> None:
         # no need to check for main worker - the writer has been initialized
         # before so that only the main worker performs io
@@ -534,6 +562,9 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             lr=lr,
             avg_grad=avg_grad,
             avg_grad_clipped=avg_grad_clipped,
+            complete=complete,
+            skipped_batches=skipped_batches,
+            source=source,
         )
         self._csv_loss_writer.write_row(row)
 
@@ -726,58 +757,184 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         loader: DataLoader[TBatch],
         items_seen_so_far: int,
         cumulative_batch_idx: int,
-    ) -> float:
+        stage: str,
+    ) -> EvalOutcome:
         """
-        Evaluate any model on any dataset.
+        Evaluate any model on any dataset, and unify the pass over the ranks.
+
+        The outcome reports what this rank actually evaluated: the loss is the
+        mean over the batches that succeeded, and the ranks reduce their sums
+        into the one value the run records. A batch that raises does not leave a
+        rank behind in the collective - the pass becomes an error outcome, all
+        ranks join it, and all of them exit together.
         """
         model.eval()
-        loss = 0.0
+        loss_sum = 0.0
+        ok_batches = 0
         time_taken = 0.0
         target_iters = (
             min(self.config.train.max_eval_steps, len(loader))
             if self.config.train.max_eval_steps
             else len(loader)
         )
-        for it, batch in enumerate(
-            tqdm(
-                loader,
-                total=target_iters,
-                desc="Evaluating",
-                leave=False,
-                disable=not self.options.display_progress,
-                mininterval=self.options.valid_prog_min_interval_seconds,
-            )
-        ):
-            if it == target_iters:
-                break
-            with torch.autocast(
-                device_type=self._device_type,
-                dtype=self.options.amp_dtype,
+        try:
+            for it, batch in enumerate(
+                tqdm(
+                    loader,
+                    total=target_iters,
+                    desc="Evaluating",
+                    leave=False,
+                    disable=not self.options.display_progress,
+                    mininterval=self.options.valid_prog_min_interval_seconds,
+                )
             ):
-                with torch.inference_mode():
-                    start_eval = time()
-                    loss_tensor = self.model_forward(
-                        cast(TModel, model),
-                        batch=batch,
-                        device=self._device,
-                    )
-                    eval_time = time() - start_eval
-                    loss += float(loss_tensor.item())
-                    # for the eval dataloader, we don't drop the last batch,
-                    # hence, the last batch might have a lower batch size.
-                    # therefore, count manually to report accurate times per
-                    # element
-                    time_taken += eval_time
-
-        if self.options.track_first_fw_bw_exec_times:
-            self._write_csv_timemem(
-                cum_batch=cumulative_batch_idx,
-                kind=ModelMode.VALID,
-                fw_time=time_taken,
-                bw_time=None,
-                num_items=items_seen_so_far,
+                if it == target_iters:
+                    break
+                with torch.autocast(
+                    device_type=self._device_type,
+                    dtype=self.options.amp_dtype,
+                ):
+                    with torch.inference_mode():
+                        start_eval = time()
+                        loss_tensor = self.model_forward(
+                            cast(TModel, model),
+                            batch=batch,
+                            device=self._device,
+                        )
+                        eval_time = time() - start_eval
+                        loss_sum += float(loss_tensor.item())
+                        ok_batches += 1
+                        # for the eval dataloader, we don't drop the last batch,
+                        # hence, the last batch might have a lower batch size.
+                        # therefore, count manually to report accurate times per
+                        # element
+                        time_taken += eval_time
+        except Exception as error:
+            local = EvalOutcome(
+                stage=stage,
+                state=EVAL_ERROR,
+                reason=f"{type(error).__name__}: {error}",
             )
-        return loss / target_iters
+        else:
+            if self.options.track_first_fw_bw_exec_times:
+                self._write_csv_timemem(
+                    cum_batch=cumulative_batch_idx,
+                    kind=ModelMode.VALID,
+                    fw_time=time_taken,
+                    bw_time=None,
+                    num_items=items_seen_so_far,
+                )
+            if ok_batches == 0:
+                # a pass that evaluated nothing has no loss to report, and a
+                # made-up one would be worse than none
+                local = EvalOutcome(
+                    stage=stage,
+                    state=EVAL_ERROR,
+                    reason="no batch of the evaluation succeeded",
+                )
+            else:
+                # an evaluation that skipped no batch is complete; a pass with
+                # skips is `incomplete` once the boundary can skip a batch at all
+                local = EvalOutcome(
+                    stage=stage,
+                    state=EVAL_COMPLETE,
+                    loss_sum=loss_sum,
+                    ok_batches=ok_batches,
+                )
+
+        return unify_eval_outcome(local, world_size=self._world_size)
+
+    def _run_validation_pass(
+        self,
+        valid_loader: DataLoader[TBatch],
+        *,
+        stage: str,
+        epoch: int,
+        batch: int,
+        cum_batch: int,
+        elements_seen: int,
+    ) -> EvalOutcome:
+        """
+        Run one validation pass through the evaluation boundary and record it.
+
+        The row carries the source of the pass, so that a scheduled validation
+        and the re-evaluation of a resumed run stay apart in the loss file.
+        """
+        outcome = self._evaluate(
+            self._model_dist,
+            valid_loader,
+            items_seen_so_far=elements_seen,
+            cumulative_batch_idx=cum_batch,
+            stage=stage,
+        )
+        loss = outcome.loss
+        # the evaluation boundary only returns without a loss in order to exit
+        assert loss is not None
+        self._write_csv_loss(
+            ModelMode.VALID,
+            loss=loss,
+            epoch=epoch,
+            batch=batch,
+            cum_batch=cum_batch,
+            elements_seen=elements_seen,
+            lr=-1,
+            avg_grad=-1,
+            avg_grad_clipped=-1,
+            complete=outcome.state == EVAL_COMPLETE,
+            skipped_batches=outcome.skipped_batches,
+            source=stage,
+        )
+        return outcome
+
+    def _offer_validated_candidate(self, loss: float) -> None:
+        """
+        Copy the state the run currently holds onto the model candidate board.
+        Only ever called for a complete validation pass.
+        """
+        # before i/o, use a barrier to make sure training states are in
+        # sync (as seen in https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html )
+        dist.barrier()
+        original_model = self._unpack_distributed_model(self._model_dist)
+        self._top_n_models.add((loss, original_model.state_dict()))
+        self._topn_has_validated_entry = True
+
+    def _re_evaluate_restored_model(
+        self,
+        valid_loader: DataLoader[TBatch],
+        *,
+        epoch: int,
+        batch: int,
+        cum_batch: int,
+        elements_seen: int,
+    ) -> None:
+        """
+        Evaluate the model a resumed run restored, before its training loop
+        starts.
+
+        The board of a resumed run starts empty - the checkpoint's loss is a
+        training-side number - so a run that only makes things worse would lose
+        the model it started from. The re-evaluation is the restored model's
+        way onto the board: a complete pass offers it as a candidate, an
+        incomplete one is only recorded, exactly as a scheduled validation.
+        """
+        outcome = self._run_validation_pass(
+            valid_loader,
+            stage=EVAL_RESUME,
+            epoch=epoch,
+            batch=batch,
+            cum_batch=cum_batch,
+            elements_seen=elements_seen,
+        )
+        self._log.info(f"Restored model validation loss: {outcome.loss} ({outcome.state})")
+        if outcome.state != EVAL_COMPLETE:
+            self._log.warning(
+                f"The restored model's validation was not complete "
+                f"({outcome.skipped_batches} batches skipped), so it does not enter the model "
+                "candidate board: the run's board starts empty"
+            )
+            return
+        assert outcome.loss is not None
+        self._offer_validated_candidate(outcome.loss)
 
     def train(
         self,
@@ -982,6 +1139,20 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._last_latest_checkpoint_step = completed_optimizer_steps
         self._last_latest_checkpoint_time = time()
         last_successful_optimizer_step: tuple[int, int, int, float] | None = None
+
+        if (
+            self.config.io.num_models_to_save > 0
+            and self._was_resumed
+            and not self.options.skip_validation
+        ):
+            self._re_evaluate_restored_model(
+                valid_loader,
+                epoch=epoch,
+                batch=epoch_batch_idx,
+                cum_batch=cum_batch,
+                elements_seen=elements_seen_total,
+            )
+
         for iteration in tqdm(
             epoch_cycler(
                 train_loader,
@@ -1072,6 +1243,9 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                     lr=self._scheduler.get_last_lr()[0],
                     avg_grad=curr_avg_grad,
                     avg_grad_clipped=curr_avg_grad_clipped,
+                    complete=True,
+                    skipped_batches=0,
+                    source=SOURCE_TRAIN,
                 )
 
             # accumulate the gradient with clipping:
@@ -1124,37 +1298,25 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             # learned from the elements yet. on a large scale, this hardly
             # matters
             if not self.options.skip_validation and cum_batch in run_valid_idxs:
-                valid_loss = self._evaluate(
-                    self._model_dist,
+                outcome = self._run_validation_pass(
                     valid_loader,
-                    items_seen_so_far=elements_seen_total,
-                    cumulative_batch_idx=cum_batch,
-                )
-                self._log.info(f"{log_prefix} Validation loss: {valid_loss}")
-                self._write_csv_loss(
-                    ModelMode.VALID,
-                    loss=valid_loss,
+                    stage=EVAL_SCHEDULED,
                     epoch=epoch,
                     batch=epoch_batch_idx,
                     cum_batch=cum_batch,
                     elements_seen=elements_seen_total,
-                    lr=-1,
-                    avg_grad=-1,
-                    avg_grad_clipped=-1,
                 )
-
-                # after validating, save the state, maybe it's really good!
-                # before i/o, use a barrier to make sure training states are in
-                # sync (as seen in https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html )
-                dist.barrier()
-                original_model = self._unpack_distributed_model(self._model_dist)
-                self._top_n_models.add(
-                    (
-                        valid_loss,
-                        original_model.state_dict(),
+                self._log.info(f"{log_prefix} Validation loss: {outcome.loss} ({outcome.state})")
+                if outcome.state == EVAL_COMPLETE:
+                    # after validating, save the state, maybe it's really good!
+                    assert outcome.loss is not None
+                    self._offer_validated_candidate(outcome.loss)
+                    self._save_training_state(next_batch_idx, next_epoch)
+                else:
+                    self._log.warning(
+                        f"{log_prefix} The validation skipped {outcome.skipped_batches} batches, "
+                        "so it is recorded but not offered as a model candidate"
                     )
-                )
-                self._save_training_state(next_batch_idx, next_epoch)
 
         else:
             # we have seen exactly local_batch_iters batches
@@ -1192,18 +1354,67 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                 )
 
         best_model = self._unpack_distributed_model(self._model_dist)
-
-        if self._is_main_writer and self.config.io.num_models_to_save > 0:
-            # the writer returns the model candidate it holds; the other ranks
-            # return their latest model, which only becomes the tested one once
-            # the chosen state is distributed to them
-            ((least_loss, best_state),) = self._top_n_models.get_top(1)
-            best_model.load_state_dict(best_state)
-            self._log.info(f"Returning model with least loss ({least_loss})")
+        self._deliver_model(best_model)
 
         self._log_cuda_memory_snapshot(None)
 
         return best_model
+
+    def _delivery_marker(self) -> str:
+        """
+        The state this run delivers to the test pass, as the marker its test row
+        carries.
+
+        A run that stores no candidate, and a resumed run whose internal option
+        skipped validation, deliver their final training state; a run whose
+        board holds a complete validation delivers the best candidate. A run
+        that should have filled its board and did not fails here rather than
+        delivering an unranked model as if it had been chosen.
+        """
+        if self.config.io.num_models_to_save == 0:
+            self._log.info(
+                "This run stores no model candidate (num_models_to_save=0): it delivers its "
+                "final training state"
+            )
+            return DELIVERY_FINAL_UNRANKED
+        if self._was_resumed and self.options.skip_validation:
+            self._log.warning(
+                "This run resumed with validation skipped (internal skip), so its model "
+                "candidate board holds no validation-side entry: it delivers its final "
+                "training state"
+            )
+            return DELIVERY_FINAL_UNRANKED
+        if self._topn_has_validated_entry:
+            self._log.info("This run holds complete validation candidates: it delivers the best")
+            return DELIVERY_TOPN_BEST
+        raise RuntimeError(
+            f"the run holds no complete validation candidate to deliver "
+            f"(num_models_to_save={self.config.io.num_models_to_save}, "
+            f"resumed={self._was_resumed}, skip_validation={self.options.skip_validation})"
+        )
+
+    def _deliver_model(self, model: TModel) -> None:
+        """
+        Choose the state this run delivers for testing and, on the global rank 0
+        writer, load it into `model`, from where it is distributed to the other
+        ranks.
+
+        Every rank joins the choice's collective, so no rank tests a state the
+        others did not settle on. The marker is an audit label on the test row:
+        it is never a resume input, and `final/unranked` is a delivery, not a
+        silent omission.
+        """
+        with required_stage(STAGE_DELIVERY, world_size=self._world_size) as delivery:
+            delivery.state = self._delivery_marker()
+        self._delivery_source = delivery.state
+
+        if self._delivery_source == DELIVERY_TOPN_BEST:
+            if self._is_main_writer:
+                ((least_loss, best_state),) = self._top_n_models.get_top(1)
+                model.load_state_dict(best_state)
+                self._log.info(f"Returning model with least validation loss ({least_loss})")
+        else:
+            self._log.info(f"Returning model with marker {self._delivery_source}")
 
     def test(
         self,
@@ -1215,13 +1426,17 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         been distributed beforehand, and the writers among the ranks record the
         result.
         """
+        assert self._delivery_source is not None, "the delivered state must be chosen first"
         # instantiate test data loader, currently
         # no additional arguments forwarded to instantiation.
         test_loader = self.get_test_dataloader(test_dataset)
         self._log.info("Started testing")
         model.eval()
-        test_loss = self._evaluate(model, test_loader, -1, -1)
-        self._log.info(f"Test loss: {test_loss}")
+        outcome = self._evaluate(model, test_loader, -1, -1, stage=EVAL_TEST)
+        test_loss = outcome.loss
+        # the evaluation boundary only returns without a loss in order to exit
+        assert test_loss is not None
+        self._log.info(f"Test loss: {test_loss} ({outcome.state})")
         self._write_csv_loss(
             ModelMode.TEST,
             loss=test_loss,
@@ -1232,5 +1447,8 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             lr=-1,
             avg_grad=-1,
             avg_grad_clipped=-1,
+            complete=outcome.state == EVAL_COMPLETE,
+            skipped_batches=outcome.skipped_batches,
+            source=self._delivery_source,
         )
         self._log.info("Finished testing")

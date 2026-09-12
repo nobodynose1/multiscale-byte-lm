@@ -233,6 +233,18 @@ class GenericOutputConfig(BaseModel, Generic[TModelParams, TTrainConfig, TIoConf
 
 
 class CSVLossEntry(NamedTuple):
+    """
+    One loss row.
+
+    `complete` and `skipped_batches` say what the row's pass actually evaluated:
+    a row is complete when every batch of its pass was evaluated, and training
+    rows are always complete with no batch skipped. `source` names what produced
+    the row - `train`, `scheduled_validation` or `resume_evaluation` - and on a
+    test row it names the state that was delivered to the test instead,
+    `topn/best` or `final/unranked`. It is an audit label only: no reader of the
+    loss file feeds it back into a run.
+    """
+
     gpu_rank: int
     timestamp: str
     elements_seen: int
@@ -244,6 +256,9 @@ class CSVLossEntry(NamedTuple):
     lr: float
     avg_grad: float
     avg_grad_clipped: float
+    complete: bool
+    skipped_batches: int
+    source: str
 
 
 class CSVTimeAndMemSnapshotEntry(NamedTuple):

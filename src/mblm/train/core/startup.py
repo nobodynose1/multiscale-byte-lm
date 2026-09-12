@@ -31,6 +31,10 @@ the ranks unify the results in the stage's collective, and only a stage that is
 ready on every rank lets the run continue. A stage that fails anywhere is
 reported on stderr and exits every rank non-zero before any run artefact is
 written.
+
+The same fixed-shape unification carries the evaluation passes and the choice
+of the state a run delivers for testing, so that a rank never records a result
+the others did not reach, and never waits inside a collective the others left.
 """
 
 import logging
@@ -58,6 +62,19 @@ STAGE_OUTPUTS = "outputs"
 STAGE_TEST_DATASETS = "test_datasets"
 STAGE_TEST_MODEL = "test_model"
 STAGE_CHECKPOINT_SAVE = "checkpoint_save"
+STAGE_DELIVERY = "delivery"
+
+# The evaluation passes a run unifies across ranks, named as the audit source
+# their loss rows carry.
+EVAL_SCHEDULED = "scheduled_validation"
+EVAL_RESUME = "resume_evaluation"
+EVAL_TEST = "test"
+
+# The states an evaluation outcome can carry: every batch was evaluated, some
+# batches were skipped, or the pass produced no usable result at all.
+EVAL_COMPLETE = "complete"
+EVAL_INCOMPLETE = "incomplete"
+EVAL_ERROR = "error"
 
 _log: logging.Logger | None = None
 
@@ -169,6 +186,116 @@ def unify_stage_outcome(local: StageOutcome, *, world_size: int) -> StageOutcome
     return decision[0]
 
 
+class EvalOutcome(BaseModel):
+    """
+    Serialized outcome of one evaluation pass on a single rank, and of the pass
+    once unified.
+
+    `state` is `complete` when every batch of the pass was evaluated and
+    `incomplete` when some batches were skipped; both carry the pass' loss as
+    the sum over the batches that succeeded, which the ranks reduce into the one
+    value the run keeps. `error` carries a reason instead and no loss at all, so
+    a failed pass can never be recorded as a metric.
+    """
+
+    stage: str
+    state: str
+    reason: str | None = None
+    loss_sum: float = 0.0
+    ok_batches: int = 0
+    skipped_batches: int = 0
+
+    @property
+    def loss(self) -> float | None:
+        """
+        The pass' mean loss over the batches that succeeded, or `None` when no
+        batch of the pass succeeded.
+        """
+        if self.ok_batches == 0:
+            return None
+        return self.loss_sum / self.ok_batches
+
+
+def _aggregate_eval(outcomes: Sequence[EvalOutcome | None]) -> EvalOutcome:
+    """
+    Unify the per-rank outcomes of one evaluation pass into the run's result.
+    """
+    ranked = [(rank, outcome) for rank, outcome in enumerate(outcomes) if outcome is not None]
+    first = ranked[0][1]
+
+    stages = {outcome.stage for _, outcome in ranked}
+    if len(stages) > 1:
+        return EvalOutcome(
+            stage=first.stage,
+            state=EVAL_ERROR,
+            reason=f"ranks disagree on the evaluation: {sorted(stages)}",
+        )
+
+    failed = [(rank, outcome) for rank, outcome in ranked if outcome.state == EVAL_ERROR]
+    if failed:
+        reasons = "; ".join(
+            f"rank {rank}: {outcome.reason or 'the evaluation failed'}" for rank, outcome in failed
+        )
+        return EvalOutcome(stage=first.stage, state=EVAL_ERROR, reason=reasons)
+
+    states = {outcome.state for _, outcome in ranked}
+    if len(states) > 1:
+        return EvalOutcome(
+            stage=first.stage,
+            state=EVAL_ERROR,
+            reason=f"ranks disagree on the state of evaluation '{first.stage}': "
+            f"{sorted(str(state) for state in states)}",
+        )
+
+    counts = {(outcome.ok_batches, outcome.skipped_batches) for _, outcome in ranked}
+    if len(counts) > 1:
+        return EvalOutcome(
+            stage=first.stage,
+            state=EVAL_ERROR,
+            reason=f"ranks disagree on the batches evaluation '{first.stage}' processed and "
+            f"skipped: {sorted(counts)}",
+        )
+
+    return EvalOutcome(
+        stage=first.stage,
+        state=first.state,
+        loss_sum=sum(outcome.loss_sum for _, outcome in ranked),
+        ok_batches=sum(outcome.ok_batches for _, outcome in ranked),
+        skipped_batches=sum(outcome.skipped_batches for _, outcome in ranked),
+    )
+
+
+def unify_eval_outcome(local: EvalOutcome, *, world_size: int) -> EvalOutcome:
+    """
+    Unify one evaluation pass over the process group.
+
+    Every rank leaves with the same result: the same state, the same counts of
+    evaluated and skipped batches, and the same loss, formed from the reduced
+    sums rather than from any one rank's average. A pass that failed on any
+    rank, or on which the ranks disagree, is reported on stderr and exits every
+    rank non-zero together: a rank that evaluated nothing must not record a
+    result the others did not reach.
+    """
+    if world_size == 1:
+        decision = _aggregate_eval([local])
+    else:
+        gathered: list[EvalOutcome | None] = [None] * world_size
+        dist.all_gather_object(gathered, local)
+
+        decisions: list[EvalOutcome | None] = [
+            _aggregate_eval(gathered) if dist.get_rank() == 0 else None
+        ]
+        dist.broadcast_object_list(decisions, src=0)
+
+        assert decisions[0] is not None
+        decision = decisions[0]
+
+    if decision.state == EVAL_ERROR:
+        bootstrap_log().fatal(f"evaluation '{decision.stage}' failed: {decision.reason}")
+        sys.exit(1)
+    return decision
+
+
 @contextmanager
 def required_stage(stage: str, *, world_size: int) -> Iterator[StageReport]:
     """
@@ -237,19 +364,28 @@ def start_trainer(trainer: "CoreTrainer[Any, Any, Any, Any, Any]", *, world_size
 
 
 __all__ = [
+    "EVAL_COMPLETE",
+    "EVAL_ERROR",
+    "EVAL_INCOMPLETE",
+    "EVAL_RESUME",
+    "EVAL_SCHEDULED",
+    "EVAL_TEST",
     "STAGE_CHECKPOINT",
     "STAGE_CHECKPOINT_SAVE",
     "STAGE_COMPONENTS",
     "STAGE_DATASETS",
+    "STAGE_DELIVERY",
     "STAGE_MODEL",
     "STAGE_OUTPUT_DIR",
     "STAGE_OUTPUTS",
     "STAGE_TEST_DATASETS",
     "STAGE_TEST_MODEL",
+    "EvalOutcome",
     "StageOutcome",
     "StageReport",
     "bootstrap_log",
     "required_stage",
     "start_trainer",
+    "unify_eval_outcome",
     "unify_stage_outcome",
 ]
