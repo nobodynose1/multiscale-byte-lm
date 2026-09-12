@@ -1,6 +1,8 @@
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, Iterator
 
+import pytest
 from pytest_mock import MockerFixture
 
 import mblm.train.mblm as train_module
@@ -30,11 +32,6 @@ class RecordingLogger:
 
     def fatal(self, *args: Any, **_kwargs: Any) -> None:
         raise AssertionError(f"the entry reported a failure: {args}")
-
-
-@contextmanager
-def fake_process_group(**_kwargs: Any) -> Iterator[ElasticRunVars]:
-    yield ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
 
 
 def block() -> TransformerBlock:
@@ -71,7 +68,7 @@ def io_config() -> TrainMBLMIoConfig:
     )
 
 
-def mbplm_entry_config(seed: int | None) -> TrainEntryConfig:
+def mbplm_entry_config(seed: int | None, **train_overrides: Any) -> TrainEntryConfig:
     return TrainEntryConfig(
         params=TrainMBLMParams(
             num_tokens=257,
@@ -90,12 +87,13 @@ def mbplm_entry_config(seed: int | None) -> TrainEntryConfig:
             learning_rate=0.001,
             gradient_accumulate_every=1,
             seed=seed,
+            **train_overrides,
         ),
         io=io_config(),
     )
 
 
-def masked_entry_config(seed: int | None) -> TrainMaskedEntryConfig:
+def masked_entry_config(seed: int | None, **train_overrides: Any) -> TrainMaskedEntryConfig:
     return TrainMaskedEntryConfig(
         params=TrainMaskedMBLMParams(
             mask_token_id=256,
@@ -110,20 +108,27 @@ def masked_entry_config(seed: int | None) -> TrainMaskedEntryConfig:
             gradient_accumulate_every=1,
             masking_proba=0.15,
             seed=seed,
+            **train_overrides,
         ),
         io=io_config(),
     )
 
 
 def run_entry(
-    mocker: MockerFixture, *, masked: bool, seed: int | None
-) -> tuple[list[str], list[str]]:
+    mocker: MockerFixture, *, masked: bool, seed: int | None, **train_overrides: Any
+) -> tuple[list[str], list[str], dict[str, Any]]:
     """
     Drive one training entry with every run piece stubbed, and record the order
-    in which the entry touches them.
+    in which the entry touches them, plus the arguments it hands to the process group.
     """
     calls: list[str] = []
     messages: list[str] = []
+    process_group_kwargs: dict[str, Any] = {}
+
+    @contextmanager
+    def fake_process_group(**kwargs: Any) -> Iterator[ElasticRunVars]:
+        process_group_kwargs.update(kwargs)
+        yield ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
 
     def fake_admission(_params: Any, **_kwargs: Any) -> MambaAdmissionState:
         calls.append("admission")
@@ -170,15 +175,15 @@ def run_entry(
     mocker.patch.object(train_module, "MaskedTrainer", TrainerStub)
 
     if masked:
-        train_encoder_mblm(masked_entry_config(seed))
+        train_encoder_mblm(masked_entry_config(seed, **train_overrides))
     else:
-        train_mblm(mbplm_entry_config(seed))
-    return calls, messages
+        train_mblm(mbplm_entry_config(seed, **train_overrides))
+    return calls, messages, process_group_kwargs
 
 
 class TestSeedWiring:
     def test_train_mblm_seeds_after_admission_and_before_the_datasets(self, mocker: MockerFixture):
-        calls, messages = run_entry(mocker, masked=False, seed=11)
+        calls, messages, _ = run_entry(mocker, masked=False, seed=11)
 
         assert calls == [
             "admission",
@@ -189,12 +194,12 @@ class TestSeedWiring:
             "marker",
             "train",
         ]
-        assert messages == ["Effective seed: 11"]
+        assert messages == ["Distributed timeout: 600 seconds", "Effective seed: 11"]
 
     def test_train_encoder_mblm_seeds_after_admission_and_before_the_datasets(
         self, mocker: MockerFixture
     ):
-        calls, messages = run_entry(mocker, masked=True, seed=11)
+        calls, messages, _ = run_entry(mocker, masked=True, seed=11)
 
         assert calls == [
             "admission",
@@ -205,10 +210,10 @@ class TestSeedWiring:
             "marker",
             "train",
         ]
-        assert messages == ["Effective seed: 11"]
+        assert messages == ["Distributed timeout: 600 seconds", "Effective seed: 11"]
 
     def test_without_a_base_seed_the_entries_do_not_seed(self, mocker: MockerFixture):
-        calls, messages = run_entry(mocker, masked=False, seed=None)
+        calls, messages, _ = run_entry(mocker, masked=False, seed=None)
 
         assert calls == [
             "admission",
@@ -219,4 +224,26 @@ class TestSeedWiring:
             "marker",
             "train",
         ]
-        assert messages == []
+        assert messages == ["Distributed timeout: 600 seconds"]
+
+
+class TestDistributedTimeoutWiring:
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_the_entries_pass_the_default_timeout_to_the_process_group(
+        self, mocker: MockerFixture, masked: bool
+    ):
+        _, messages, process_group_kwargs = run_entry(mocker, masked=masked, seed=None)
+
+        assert process_group_kwargs["timeout"] == timedelta(seconds=600)
+        assert messages == ["Distributed timeout: 600 seconds"]
+
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_the_configured_timeout_reaches_the_process_group_and_the_log(
+        self, mocker: MockerFixture, masked: bool
+    ):
+        _, messages, process_group_kwargs = run_entry(
+            mocker, masked=masked, seed=None, distributed_timeout_seconds=1234
+        )
+
+        assert process_group_kwargs["timeout"] == timedelta(seconds=1234)
+        assert messages == ["Distributed timeout: 1234 seconds"]

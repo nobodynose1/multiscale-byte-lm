@@ -22,6 +22,7 @@ SOFTWARE."""
 
 import os
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Literal
 
 import torch
@@ -47,7 +48,9 @@ def _torchrun_env_variables(is_cuda: bool) -> ElasticRunVars:
 
 
 @contextmanager
-def process_group(*, backend: Literal["gloo", "nccl"] | None = None):
+def process_group(
+    *, backend: Literal["gloo", "nccl"] | None = None, timeout: timedelta | None = None
+):
     """
     Context manager for initializing a distributed process group and
     automatically destroying resources upon exit. See
@@ -57,6 +60,8 @@ def process_group(*, backend: Literal["gloo", "nccl"] | None = None):
         backend ("gloo", "nccl" or None = None): By default, uses nccl if CUDA is
             available, else gloo. Set this explicitly if you want to use nccl in
             the presence of CUDA-incompatible GPUs
+        timeout (timedelta or None = None): Explicit timeout for the operations
+            executed against the process group. `None` keeps the torch default
 
     **Example**::
 
@@ -70,7 +75,7 @@ def process_group(*, backend: Literal["gloo", "nccl"] | None = None):
     if not backend:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
 
-    init_process_group(backend=backend)
+    init_process_group(backend=backend, timeout=timeout)
     is_cuda = backend == "nccl"
     run_vars = _torchrun_env_variables(is_cuda)
 

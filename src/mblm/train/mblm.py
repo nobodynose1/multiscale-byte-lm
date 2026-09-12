@@ -24,6 +24,7 @@ import math
 import os
 import sys
 from abc import abstractmethod
+from datetime import timedelta
 from typing import Any, Callable, Iterator, Protocol, TypeVar
 
 import torch
@@ -302,7 +303,9 @@ _DATASET_STAGE = "datasets"
 def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
     log = create_logger(__name__, log_dir=config.io.output_dir)
     try:
-        with process_group(backend="gloo") as run_vars:
+        timeout_seconds = config.train.distributed_timeout_seconds
+        log.info(f"Distributed timeout: {timeout_seconds} seconds")
+        with process_group(backend="gloo", timeout=timedelta(seconds=timeout_seconds)) as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
             effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
             if effective_seed is not None:
@@ -341,7 +344,9 @@ def train_mblm(config: TrainEntryConfig) -> None:
     log = create_logger(__name__, log_dir=config.io.output_dir)
 
     try:
-        with process_group(backend="nccl") as run_vars:
+        timeout_seconds = config.train.distributed_timeout_seconds
+        log.info(f"Distributed timeout: {timeout_seconds} seconds")
+        with process_group(backend="nccl", timeout=timedelta(seconds=timeout_seconds)) as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
             effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
             if effective_seed is not None:
