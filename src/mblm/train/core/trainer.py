@@ -68,7 +68,6 @@ from mblm.utils.io import (
     save_training_checkpoint_state,
 )
 from mblm.utils.logging import create_logger
-from mblm.utils.misc import retry
 from mblm.utils.top_n import TopN
 
 TModel = TypeVar("TModel", bound=torch.nn.Module)
@@ -80,7 +79,6 @@ class CoreTrainerOptions:
     config_file_name: str = "config.yaml"
     loss_file_name: str = "loss.csv"
     timemem_file_name: str = "timemem.csv"
-    max_train_restarts: int = 0
     skip_validation: bool = False
     display_progress: bool = sys.stdout.isatty()
     train_prog_min_interval_seconds: int = 1
@@ -760,18 +758,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         valid_dataset: DistributedDataset[TBatch],
     ) -> TModel | None:
         self._running_summary_stats.training_start = datetime.now().isoformat()
-
-        def on_error(error: Exception, retries_left: int):
-            self._log.fatal(
-                f"Training failed, {retries_left}/{self.options.max_train_restarts} retries left"
-            )
-            self._log.fatal(error, exc_info=True)
-            self._running_summary_stats.error = str(error)
-            if self.options.display_progress:
-                print(error)
-
-        train_with_retry = retry(self.options.max_train_restarts, on_error=on_error)(self._train)
-        best_model = train_with_retry(train_dataset, valid_dataset)
+        best_model = self._train(train_dataset, valid_dataset)
 
         self._running_summary_stats.training_end = datetime.now().isoformat()
         self._log_cuda_memory_snapshot(-99)
