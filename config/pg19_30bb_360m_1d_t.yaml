@@ -15,6 +15,7 @@ params:
   num_layers: [42]
   train_checkpoint_chunks: null
   block:
+    block_type: transformer
     attn_head_dims: 64
     attn_num_heads: 16
     attn_use_rot_embs: true

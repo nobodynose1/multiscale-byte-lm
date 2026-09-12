@@ -21,7 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
 
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import Field, model_validator
 
@@ -63,6 +63,13 @@ class MambaBlock(StageBlock):
     )
 
     block_type: str = Field(init=False, default=mamba_shim.UNRESOLVED)
+
+    parse_keys: ClassVar[tuple[str, ...]] = (
+        mamba_shim.UNRESOLVED,
+        mamba_shim.MAMBA1,
+        mamba_shim.MAMBA2,
+    )
+    """The Mamba engine is declared by `mamba_backend`; these keys only route the parse"""
 
     def to_model(self, model_dim, num_layers):
         backend = mamba_shim.bound_backend()

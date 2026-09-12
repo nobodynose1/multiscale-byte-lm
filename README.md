@@ -210,7 +210,9 @@ x = torch.randint(0, 258, (1, 12)).long()
 mblm.forward(x, return_type=MBLMReturnType.LOSS)
 ```
 
-If you want to parse a YAML config to a custom block, **register the block** before creating the model:
+If you want to parse a YAML config to a custom block, **register the block** before creating the model.
+Every block in the YAML must declare a `block_type` that names a registered block — the example below
+uses `lstm` for the custom block and `transformer` for the built-in one:
 
 ```py
 import torch
@@ -259,10 +261,12 @@ num_layers: [5, 5]
 pad_token_id: 256
 train_checkpoint_chunks: null
 block:
-    - dropout: 0.1
+    - block_type: lstm
+      dropout: 0.1
       my_property: 1
       pos_emb_type: null
-    - attn_head_dims: 64
+    - block_type: transformer
+      attn_head_dims: 64
       attn_num_heads: 16
       attn_use_rot_embs: true
       use_flash_attn: true

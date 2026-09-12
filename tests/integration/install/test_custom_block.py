@@ -113,10 +113,12 @@ def test_from_yaml():
     pad_token_id: 256
     train_checkpoint_chunks: null
     block:
-        - dropout: 0.1
+        - block_type: lstm
+          dropout: 0.1
           my_property: 1
           pos_emb_type: null
-        - attn_head_dims: 64
+        - block_type: transformer
+          attn_head_dims: 64
           attn_num_heads: 16
           attn_use_rot_embs: true
           use_flash_attn: true

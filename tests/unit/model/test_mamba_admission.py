@@ -87,7 +87,14 @@ def test_backends_are_not_imported_when_the_configuration_is_imported():
 @pytest.mark.parametrize("backend", ["mamba1", "mamba2"])
 def test_declared_engines_parse_to_a_mamba_block(backend: str):
     parsed = model_params(
-        {"d_state": 128, "d_conv": 4, "expand": 2, "headdim": 64, "mamba_backend": backend}
+        {
+            "block_type": mamba_shim.UNRESOLVED,
+            "d_state": 128,
+            "d_conv": 4,
+            "expand": 2,
+            "headdim": 64,
+            "mamba_backend": backend,
+        }
     )
     assert isinstance(parsed.block, MambaBlock)
     assert parsed.block.mamba_backend == backend
@@ -104,7 +111,14 @@ def test_unsupported_engine_declarations_are_rejected(backend: Any):
     # the configuration as a whole is rejected, it does not fall back to another block
     with pytest.raises(ValidationError):
         model_params(
-            {"d_state": 128, "d_conv": 4, "expand": 2, "headdim": 64, "mamba_backend": backend}
+            {
+                "block_type": mamba_shim.UNRESOLVED,
+                "d_state": 128,
+                "d_conv": 4,
+                "expand": 2,
+                "headdim": 64,
+                "mamba_backend": backend,
+            }
         )
 
 
@@ -116,7 +130,15 @@ def test_missing_engine_declaration_is_rejected():
     assert "mamba_backend" in str(error.value)
 
     with pytest.raises(ValidationError):
-        model_params({"d_state": 128, "d_conv": 4, "expand": 2, "headdim": 64})
+        model_params(
+            {
+                "block_type": mamba_shim.UNRESOLVED,
+                "d_state": 128,
+                "d_conv": 4,
+                "expand": 2,
+                "headdim": 64,
+            }
+        )
 
 
 def test_declared_engine_is_read_from_the_parsed_configuration():

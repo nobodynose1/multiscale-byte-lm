@@ -75,13 +75,15 @@ def test_from_yaml():
     pad_token_id: 256
     train_checkpoint_chunks: null
     block:
-      - d_state: 128
+      - block_type: mamba1
+        d_state: 128
         d_conv: 4
         expand: 2
         headdim: 64
         mamba_backend: mamba1
         pos_emb_type: null
-      - attn_head_dims: 64
+      - block_type: transformer
+        attn_head_dims: 64
         attn_num_heads: 16
         attn_use_rot_embs: true
         use_flash_attn: true

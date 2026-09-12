@@ -30,6 +30,7 @@ params:
   num_layers: [54]
   train_checkpoint_chunks: null
   block:
+    block_type: mamba2
     d_state: 128
     d_conv: 4
     expand: 2

@@ -15,19 +15,22 @@ params:
   num_layers: [9, 8, 8]
   train_checkpoint_chunks: [10, 20]
   block:
-    - d_state: 128
+    - block_type: mamba2
+      d_state: 128
       d_conv: 4
       expand: 2
       headdim: 64
       mamba_backend: mamba2
       pos_emb_type: null
-    - attn_head_dims: 64
+    - block_type: transformer
+      attn_head_dims: 64
       attn_num_heads: 16
       attn_use_rot_embs: true
       attn_dropout: 0
       use_flash_attn: true
       pos_emb_type: fixed
-    - attn_head_dims: 64
+    - block_type: transformer
+      attn_head_dims: 64
       attn_num_heads: 16
       attn_use_rot_embs: true
       attn_dropout: 0
