@@ -550,6 +550,7 @@ class MBLM(nn.Module):
         # rearrange for loss calculation: the k-dimensional loss expects (B, V,
         # L)
         preds = rearrange(logits_rearranged, "b l v -> b v l")
+        assert input_ids is not None
         targets = rearrange(input_ids, "b ... -> b (...)")
         valid_loss_mask = targets != self.pad_token_id
 
