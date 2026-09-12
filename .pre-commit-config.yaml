@@ -19,6 +19,14 @@ repos:
         language: system
         types_or: [python, jupyter]
         verbose: true
+      - id: check-types
+        name: Check types
+        # mirrors `make check_types` - needs the whole project, not just staged files
+        entry: uv run mypy src tests scripts
+        language: system
+        always_run: true
+        pass_filenames: false
+        verbose: true
       - id: add-license-headers
         name: Add License Headers
         entry: uv run python .hooks/licenseheaders.py src --changed-only
