@@ -65,12 +65,12 @@ class TestMBLM:
             return_type=MBLMReturnType.LOSS,
         )
         assert torch.equal(loss, loss_with_identity_mask)
-        empty_loss = mblm.forward(
-            input_ids,
-            loss_mask=torch.zeros_like(input_ids),
-            return_type=MBLMReturnType.LOSS,
-        )
-        assert empty_loss.item() == 0.0
+        with pytest.raises(FloatingPointError, match="No valid loss elements"):
+            mblm.forward(
+                input_ids,
+                loss_mask=torch.zeros_like(input_ids),
+                return_type=MBLMReturnType.LOSS,
+            )
 
     def test_generate(self):
         ctx_windows = [12, 4]
@@ -226,7 +226,7 @@ class TestMaskedMBLM:
         # batch size
         assert out.size(0) == torch.prod(torch.tensor([batch_size, *seq_lens][: stage_idx + 1]))
 
-    def test_masked_mblm_fully_masked_returns_0_as_loss(
+    def test_masked_mblm_fully_masked_raises(
         self,
     ):
         conf = self.mblm_conf
@@ -240,11 +240,13 @@ class TestMaskedMBLM:
         mask = torch.zeros_like(input_ids)
         mask = mask.to(torch.bool)
         masked_input[mask] = self.mask_token_id
-        loss = masked_model.forward(  # type: ignore
-            masked_input, attention_mask=mask, labels=input_ids, return_type=MBLMReturnType.LOSS
-        )
-
-        assert torch.isclose(loss, torch.tensor(0.0)), f"Got {loss.item()}"
+        with pytest.raises(FloatingPointError, match="No valid loss elements"):
+            masked_model.forward(  # type: ignore
+                masked_input,
+                attention_mask=mask,
+                labels=input_ids,
+                return_type=MBLMReturnType.LOSS,
+            )
 
     def test_masked_mblm_partially_masked_is_float(
         self,
