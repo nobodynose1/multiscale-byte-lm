@@ -181,7 +181,11 @@ class TestZeroStepGuard:
         mocker.patch.object(
             trainer_module,
             "load_training_checkpoint_state",
-            lambda _path, model, **_kwargs: (model, 12.5, {}),
+            lambda _path, model, **_kwargs: (
+                model,
+                12.5,
+                {"EPOCH": 1, "BATCH": 0, "CUM_BATCH": 1},
+            ),
         )
         # the checkpoint cursor sits at epoch 1 of a loader holding a single
         # batch: the target is already reached, nothing is left to train
@@ -191,9 +195,7 @@ class TestZeroStepGuard:
             entry_config(
                 tmp_path,
                 gradient_accumulate_every=2,
-                resume=ResumeConfig(
-                    checkpoint_file="unused.pth", next_epoch_index=1, next_batch_index=0
-                ),
+                resume=ResumeConfig(checkpoint_file="unused.pth"),
             ),
         )
 

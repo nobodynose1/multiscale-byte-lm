@@ -24,8 +24,9 @@ import csv
 import json
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Generic, Iterable, NamedTuple, TypeAlias, TypeVar
+from typing import Any, Callable, Generic, NamedTuple, TypeAlias, TypeVar
 
 import torch
 import yaml
@@ -266,6 +267,43 @@ def load_checkpoint_snapshot(
     )
 
 
+@dataclass(frozen=True)
+class CheckpointCursor:
+    """
+    The training position a checkpoint was written at.
+    """
+
+    epoch: int
+    batch: int
+    cum_batch: int
+
+
+_CURSOR_KEYS = ("EPOCH", "BATCH", "CUM_BATCH")
+
+
+def read_checkpoint_cursor(snapshot: StateDict) -> CheckpointCursor:
+    """
+    Read the cursor a checkpoint carries. The checkpoint is the only source of
+    the resume position, so a checkpoint without a usable cursor is an error
+    rather than a reason to fall back to a config value.
+    """
+    values: dict[str, int] = {}
+    for key in _CURSOR_KEYS:
+        if key not in snapshot:
+            raise ValueError(f"Checkpoint is missing the {key} cursor entry")
+        value = snapshot[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Checkpoint cursor {key} is not an integer: {value!r}")
+        if value < 0:
+            raise ValueError(f"Checkpoint cursor {key} is negative: {value}")
+        values[key] = value
+    return CheckpointCursor(
+        epoch=values["EPOCH"],
+        batch=values["BATCH"],
+        cum_batch=values["CUM_BATCH"],
+    )
+
+
 def _move_optimizer_state_to_device(optimizer: Any, device: str) -> None:
     for state in optimizer.state.values():
         for key, value in state.items():
@@ -301,31 +339,12 @@ def load_training_checkpoint_state(
     grad_scaler: Any | None = None,
     map_location: MAP_LOCATION | None = None,
     optimizer_device: str | None = None,
-    map_extend_embeddings: set[str] | None = None,
-    map_rename_modules: Iterable[tuple[str, str]] | None = None,
-    on_success: Callable[[str], Any] | None = None,
 ) -> tuple[_TModule, float, StateDict]:
     """
     Restore a model and, when present, optimizer/scheduler/scaler state.
     """
     snapshot = load_checkpoint_snapshot(checkpoint_file, map_location=map_location)
-    state_dict = snapshot["MODEL"]
-    loss = snapshot["LOSS"]
-
-    def _notify(msg: str):
-        if on_success:
-            on_success(msg)
-
-    if map_rename_modules:
-        state_dict = _modules_map_rename(state_dict, map_rename_modules, notify=_notify)
-    if map_extend_embeddings:
-        state_dict = _embedding_map_extend(
-            state_dict,
-            model.state_dict(),
-            map_extend_embeddings,
-            notify=_notify,
-        )
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(snapshot["MODEL"], strict=True)
 
     restore_training_component_states(
         snapshot,
@@ -335,105 +354,4 @@ def load_training_checkpoint_state(
         optimizer_device=optimizer_device,
     )
 
-    return model, loss, snapshot
-
-
-def _embedding_map_extend(
-    src_state: dict[str, torch.Tensor],
-    tgt_state: dict[str, torch.Tensor],
-    map_extend_embeddings: set[str],
-    notify: Callable[[str], Any],
-) -> dict[str, torch.Tensor]:
-    """
-    Special loader for when we have module A with an embedding or linear layer
-    of size (N, D) and module B with embedding or linear layer of size (N+i, D).
-    This function transfers the source weights and biases into the corresponding
-    positions in the target, leaving additional entries uninitialized or
-    randomly initialized. Hence, it is required that the source size in A is
-    smaller than the target size in B. At the moment, we only support this
-    extending strategy, not shrinking.
-    """
-    # TODO: Allow init of newly added embeddings with mean, similar to
-    # https://github.com/huggingface/transformers/blob/ccbd57a8b665fbb5b1d566c0b800dc6ede509e8e/src/transformers/modeling_utils.py#L2465
-    for (src_key, src_tensor), (tgt_key, tgt_tensor) in zip(src_state.items(), tgt_state.items()):
-        if src_key != tgt_key:
-            raise ValueError(
-                f"Expected source and target state dict to match ({src_key} != {tgt_key})"
-            )
-        if src_key not in map_extend_embeddings:
-            # ignore this key
-            continue
-
-        if src_key.endswith("weight") and src_tensor.size(1) != tgt_tensor.size(1):
-            raise ValueError(
-                "Mapping to a smaller embedding dimension is not supported",
-            )
-
-        if (src_n_ids := src_tensor.size(0)) > tgt_tensor.size(0):
-            raise ValueError(
-                "Mapping to a smaller number of embeddings is not supported",
-            )
-        tgt_state[tgt_key][:src_n_ids] = src_tensor.detach()
-        notify(f"Successfully moved embeddings from {src_key}")
-    return tgt_state
-
-
-def _modules_map_rename(
-    src_state: dict[str, torch.Tensor],
-    map_rename_modules: Iterable[tuple[str, str]],
-    notify: Callable[[str], Any],
-) -> dict[str, torch.Tensor]:
-    """
-    Rename entries in a state dict in place by providing a map of
-    (source_prefix, target_prefix). As soon as a compatible entry is found,
-    i.e., a key in the state dict matches `source_prefix`, `source_prefix` is
-    replaced with `target_prefix`
-    """
-    src_state_updated = src_state.copy()
-    for rename_from_refix, rename_to_prefix in map_rename_modules:
-        for src_module_name in src_state.keys():
-            if src_module_name.startswith(rename_from_refix):
-                data = src_state_updated.pop(src_module_name)
-                postfix = src_module_name[len(rename_from_refix) :]
-                tgt_module_name = rename_to_prefix + postfix
-                src_state_updated[tgt_module_name] = data
-                notify(f"Successfully renamed {src_module_name + postfix} to {tgt_module_name}")
-    return src_state_updated
-
-
-@torch.no_grad()
-def load_model_state(
-    checkpoint_file: str | Path,
-    model: _TModule,
-    map_location: MAP_LOCATION | None = None,
-    map_extend_embeddings: set[str] | None = None,
-    map_rename_modules: Iterable[tuple[str, str]] | None = None,
-    on_success: Callable[[str], Any] | None = None,
-) -> tuple[_TModule, float]:
-    """
-    Restore a model's `state_dict` from a checkpoint and return it.
-
-    Args:
-        checkpoint_file: Must point to a `.pth` file
-        model: Any class T that inherits from `torch.nn.Module`
-        map_location: See `torch.load`
-        map_extend_embeddings: Map a smaller source embedding to a
-            larger target embedding
-        map_rename_modules: Rename modules in the checkpoint state
-            before populating the model with it. If provided in the form
-            (source_prefix, target_prefix), the state dict will be
-            renamed BEFORE `map_extend_embeddings` is applied!
-
-    Returns:
-        tuple: A tuple with the original model `T` with
-            `updated state_dict` and the associated loss
-    """
-    model, loss, _ = load_training_checkpoint_state(
-        checkpoint_file,
-        model,
-        map_location=map_location,
-        map_extend_embeddings=map_extend_embeddings,
-        map_rename_modules=map_rename_modules,
-        on_success=on_success,
-    )
-    return model, loss
+    return model, snapshot["LOSS"], snapshot

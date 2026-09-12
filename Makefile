@@ -86,7 +86,9 @@ E2E_RUN_TORCH = OMP_NUM_THREADS=1 \
 	uv run torchrun --nproc_per_node=4 \
 	tests/e2e/trainer/run_trainer.py
 E2E_RUN_VALIDATE = uv run tests/e2e/trainer/validate.py
+E2E_MAKE_RESUME = uv run tests/e2e/trainer/make_resume_config.py
 E2E_TEST_ROOT = tests/e2e/trainer
+E2E_RESUME_CONFIGS = $(E2E_TEST_ROOT)/outputs/resume-configs
 
 .PHONY: test_e2e
 test_e2e:
@@ -111,11 +113,17 @@ test_e2e_trainer:
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_1
 
 	@echo "Chaining run 2 to run 1"
-	TEST_ID=2 $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/outputs/my-model_1/config.yaml
+	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1-epoch.yaml \
+		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_1/latest.pth \
+		--out $(E2E_RESUME_CONFIGS)/my-model_2.yaml
+	TEST_ID=2 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_2.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_2
 
 	@echo "Chaining run 3 to run 2"
-	TEST_ID=3 $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/outputs/my-model_2/config.yaml
+	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1-epoch.yaml \
+		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_2/latest.pth \
+		--out $(E2E_RESUME_CONFIGS)/my-model_3.yaml
+	TEST_ID=3 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_3.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_3
 
 	@echo "Asserting on chained training runs 1, 2, 3"
@@ -131,7 +139,10 @@ test_e2e_trainer:
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_4
 
 	@echo "Chaining run 5 to run 4"
-	TEST_ID=5 $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/outputs/my-model_4/config.yaml
+	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1.5-epoch.yaml \
+		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_4/latest.pth \
+		--out $(E2E_RESUME_CONFIGS)/my-model_5.yaml
+	TEST_ID=5 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_5.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_5
 
 	@echo "Asserting on chained training runs 4, 5"
@@ -145,7 +156,10 @@ test_e2e_trainer:
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_6
 
 	@echo "Chaining run 7 to run 6"
-	TEST_ID=7 $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/outputs/my-model_6/config.yaml
+	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-0.5-epoch.yaml \
+		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_6/latest.pth \
+		--out $(E2E_RESUME_CONFIGS)/my-model_7.yaml
+	TEST_ID=7 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_7.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_7
 	
 	@echo "Asserting on chained training runs 6, 7"

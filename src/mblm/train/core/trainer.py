@@ -20,7 +20,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
-import json
 import logging
 import math
 import sys
@@ -29,11 +28,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import time
-from typing import Any, Generic, Iterable, Iterator, Literal, Sequence, TypeVar, cast
+from typing import Any, Generic, Iterator, Literal, Sequence, TypeVar, cast
 
 import torch
 import torch.distributed as dist
-import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer  # type: ignore
 from torch.optim.lr_scheduler import LRScheduler
@@ -49,7 +47,7 @@ from mblm.train.core.config import (
     CSVTimeAndMemSnapshotEntry,
     GenericEntryConfig,
     GenericOutputConfig,
-    ResumeConfig,
+    ResumeMetadata,
     SummaryStats,
     TIoConfig,
     TModelParams,
@@ -59,10 +57,12 @@ from mblm.train.core.iter import epoch_cycler
 from mblm.utils.cuda import IS_BF16_AVAILABLE, cuda_memory_snapshot, cuda_properties
 from mblm.utils.distributed import ElasticRunVars
 from mblm.utils.io import (
+    CheckpointCursor,
     CSVWriter,
     StateDict,
     dump_yml,
     load_training_checkpoint_state,
+    read_checkpoint_cursor,
     restore_training_component_states,
     save_model_state,
     save_training_checkpoint_state,
@@ -123,14 +123,14 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
     # misc - created internally
     _output_dir: Path
-    _running_resume_conf: ResumeConfig
+    _resume_metadata: ResumeMetadata
     _running_summary_stats: SummaryStats
     _top_n_models: TopN[StateDict]
     _csv_loss_writer: CSVWriter[CSVLossEntry]
     _csv_timemem_writer: CSVWriter[CSVTimeAndMemSnapshotEntry]
     _log: logging.Logger
     _resume_training_snapshot: StateDict | None
-    _auto_resume_latest_path: Path | None
+    _resume_cursor: CheckpointCursor | None
     _last_latest_checkpoint_step: int
     _last_latest_checkpoint_time: float
 
@@ -142,8 +142,8 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     ):
         self.config = config
         self.options = options or CoreTrainerOptions()
-        self._auto_resume_latest_path = self._configure_auto_resume_latest()
         self._resume_training_snapshot = None
+        self._resume_cursor = None
         self._last_latest_checkpoint_step = 0
         self._last_latest_checkpoint_time = time()
         self._world_size = run_vars.world_size
@@ -189,41 +189,29 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         model = self.init_model().to(self._device)
         if config.resume:
             self._log.info("Initiating model loading from checkpoint")
-            map_extend_embeddings = (
-                self.migrate_embeddings_if_enabled() if config.resume.migrate_embeddings else None
-            )
-            map_rename_modules = (
-                self.rename_modules_if_enabled() if config.resume.rename_modules else None
-            )
             model, model_loss, self._resume_training_snapshot = load_training_checkpoint_state(
                 config.resume.checkpoint_file,
                 model,
                 map_location="cpu",
-                map_extend_embeddings=map_extend_embeddings,
-                map_rename_modules=map_rename_modules,
-                on_success=self._log.debug,
             )
+            # the checkpoint carries the training position, so the loop never
+            # needs a config-provided cursor
+            self._resume_cursor = read_checkpoint_cursor(self._resume_training_snapshot)
             # save the restored model to the top n to make sure we keep the best
             # model from the previous run should we only make everything worse
             # during this training
             self._top_n_models.add((model_loss, model.state_dict()))
             self._resume_training_snapshot.pop("MODEL", None)
             self._log.info(f"Loaded model with loss {model_loss:.4f} from checkpoint")
-            if self._auto_resume_latest_path:
-                self._log.info(
-                    f"Auto-resuming from latest checkpoint: {self._auto_resume_latest_path}"
-                )
         else:
             self._log.info("Creating new model")
 
         self._model_dist = self._init_distributed_model(model)
 
-        # initialize the running resume/summary configs that are updated on the fly
-        self._running_resume_conf = ResumeConfig(
-            checkpoint_file="",
-            next_batch_index=-1,
-            next_epoch_index=-1,
-            resumed_from=config.resume.checkpoint_file if config.resume else None,
+        # the output config only records provenance; the cursor stays in the
+        # checkpoint and is never written back to a config file
+        self._resume_metadata = ResumeMetadata(
+            parent_checkpoint=config.resume.checkpoint_file if config.resume else None,
         )
         cuda_info = cuda_properties()
         main_model_params, submodule_params = self.configure_count_parameters(model)
@@ -241,63 +229,6 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._log.info(f"Model parameters: {main_model_params}, ({submodule_params})")
         self._log.info(f"Configuration: {config}")
         self._log.info(f"CUDA: {cuda_info}")
-
-    def _configure_auto_resume_latest(self) -> Path | None:
-        if self.config.resume or not self.config.train.auto_resume_latest:
-            return None
-
-        output_root = Path(self.config.io.output_dir)
-        if not output_root.is_dir():
-            return None
-
-        candidates: list[tuple[float, Path, Path, dict[str, Any]]] = []
-        for run_dir in output_root.glob(f"{self.config.io.name_model}_*"):
-            latest_path = run_dir / self.config.train.latest_checkpoint_name
-            config_path = run_dir / self.options.config_file_name
-            if not latest_path.is_file() or not config_path.is_file():
-                continue
-            try:
-                with config_path.open("r", encoding="utf-8") as file:
-                    saved_config = yaml.safe_load(file) or {}
-            except OSError:
-                continue
-            if not self._saved_config_is_resume_compatible(saved_config):
-                continue
-            resume_conf = saved_config.get("resume") or {}
-            if resume_conf.get("next_epoch_index") is None:
-                continue
-            if resume_conf.get("next_batch_index") is None:
-                continue
-            candidates.append((latest_path.stat().st_mtime, latest_path, config_path, resume_conf))
-
-        if not candidates:
-            return None
-
-        _, latest_path, config_path, resume_conf = max(
-            candidates, key=lambda candidate: candidate[0]
-        )
-        self.config.resume = ResumeConfig(
-            checkpoint_file=str(latest_path),
-            next_epoch_index=int(resume_conf["next_epoch_index"]),
-            next_batch_index=int(resume_conf["next_batch_index"]),
-            migrate_embeddings=bool(resume_conf.get("migrate_embeddings", False)),
-            rename_modules=bool(resume_conf.get("rename_modules", False)),
-            resumed_from=str(config_path),
-        )
-        return latest_path
-
-    def _saved_config_is_resume_compatible(self, saved_config: dict[str, Any]) -> bool:
-        saved_io = saved_config.get("io") or {}
-        saved_params = saved_config.get("params")
-        return saved_io.get(
-            "name_model"
-        ) == self.config.io.name_model and self._normalise_config_fragment(
-            saved_params
-        ) == self._normalise_config_fragment(self.config.params.model_dump(mode="json"))
-
-    @staticmethod
-    def _normalise_config_fragment(value: Any) -> Any:
-        return json.loads(json.dumps(value, sort_keys=True, default=str))
 
     """ Abstract methods that must be implemented """
 
@@ -405,22 +336,6 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         """
         return self._output_dir
 
-    def migrate_embeddings_if_enabled(self) -> set[str] | None:
-        """
-        When resuming training from a model, a smaller number of embeddings can
-        be migrated to a larger number. This can be enabled via the resume
-        config.
-        """
-        return None
-
-    def rename_modules_if_enabled(self) -> Iterable[tuple[str, str]] | None:  # noqa: ARG003
-        """
-        When resuming training from a model where modules are named differently,
-        provide a map in the form (source_prefix, target_prefix) to override
-        module names.
-        """
-        return None
-
     """ Utility functions  """
 
     def _init_distributed_model(self, base_model: TModel) -> DistributedDataParallel:
@@ -462,7 +377,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             io=self.config.io,
             params=self.config.params,
             train=self.config.train,
-            resume=self._running_resume_conf,
+            resume=self._resume_metadata,
             summary=self._running_summary_stats,
         )
         dump_yml(self._output_dir / self.options.config_file_name, output_config)
@@ -609,7 +524,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             return
 
         original_model = self._unpack_distributed_model(self._model_dist)
-        _, latest_model_path = save_training_checkpoint_state(
+        save_training_checkpoint_state(
             self._output_dir,
             self.config.train.latest_checkpoint_name,
             model=original_model,
@@ -622,10 +537,6 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             cum_batch=next_cumulative_batch_idx,
         )
 
-        self._running_resume_conf.next_batch_index = next_batch_idx
-        self._running_resume_conf.next_epoch_index = next_epoch
-        self._running_resume_conf.checkpoint_file = str(latest_model_path)
-        self._dump_output_config()
         self._log.debug(
             f"Saved latest training state at epoch {next_epoch}, batch {next_batch_idx}"
         )
@@ -671,16 +582,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     def _save_training_state(self, batch_i: int, epoch: int):
         if not self._is_main_worker:
             return
-        num_written, num_overwritten, best_model_path = self._save_best_models()
+        num_written, num_overwritten, _ = self._save_best_models()
         self._log.debug(
             f"Saved {num_written} best model(s) (overwrote {num_overwritten})",
         )
-
-        if not self.config.train.latest_checkpoint_enabled:
-            # mutate running config in place, then save back
-            self._running_resume_conf.next_batch_index = batch_i
-            self._running_resume_conf.next_epoch_index = epoch
-            self._running_resume_conf.checkpoint_file = str(best_model_path)
 
         self._dump_output_config()
         self._log.debug(f"Saved training state at epoch {epoch}, batch {batch_i}")
@@ -919,10 +824,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
         epoch: int = 0
         epoch_batch_idx: int = 0
-        if self.config.resume:
+        if self._resume_cursor is not None:
             self._log.debug("Resuming training, offsetting start epoch and batch index")
-            epoch = self.config.resume.next_epoch_index
-            epoch_batch_idx = self.config.resume.next_batch_index
+            epoch = self._resume_cursor.epoch
+            epoch_batch_idx = self._resume_cursor.batch
             train_dataset.offset_to(epoch)
         else:
             self._log.info("Starting training from scratch")

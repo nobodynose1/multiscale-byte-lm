@@ -38,7 +38,6 @@ from mblm.data.dataset.pg19_masked import PG19Masked
 from mblm.data.datasets import DistributedDataset
 from mblm.data.types import BatchMaskedForMLM, BatchWithLossMask, ModelMode
 from mblm.model.config import MBLMEncoderModelConfig, MBLMModelConfig, MBLMReturnType
-from mblm.model.embeddings import MBLM_TOKEN_EMB_MIGRATION
 from mblm.model.mamba_admission import run_mamba_admission, write_mamba_impl_marker
 from mblm.model.mblm import MBLM, MBLMEncoder
 from mblm.model.utils import count_params
@@ -282,12 +281,6 @@ class MegabyteTrainer(
 
     def configure_count_parameters(self, model):
         return count_params(model)
-
-    def migrate_embeddings_if_enabled(self):
-        # older versions - the pg19 pretrained models - of mblm may have been trained
-        # without modality tokens - provide this map to migrate the embeddings.
-        # enabled via yaml config
-        return MBLM_TOKEN_EMB_MIGRATION
 
 
 dataset_registry = DatasetRegistry()

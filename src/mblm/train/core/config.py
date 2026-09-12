@@ -48,6 +48,8 @@ class CoreTrainConfig(BaseModel):
     `CoreTrainer`.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     seed: int | None = Field(
         default=None,
         description="The base seed of the run. When set, every rank seeds its RNG streams with this base seed plus its global rank, before any model or dataset is built. `None` keeps the current behaviour of an unseeded run",
@@ -90,10 +92,6 @@ class CoreTrainConfig(BaseModel):
         default=True,
         description="Write a latest checkpoint for interruption-safe training resume",
     )
-    auto_resume_latest: bool = Field(
-        default=True,
-        description="When no explicit resume is configured, resume from the newest compatible latest checkpoint",
-    )
     latest_checkpoint_interval_steps: int = Field(
         default=100,
         ge=1,
@@ -120,25 +118,28 @@ class TrainMaskedConfig(CoreTrainConfig):
 
 class ResumeConfig(BaseModel):
     """
-    The resume parameters needed for to resume training from a checkpoint and a
-    specific epoch and batch with `CoreTrainer`. In case training starts for the
-    first time, this class is not needed. For a completed training run, it is
-    automatically populated so that it can be used in a future training run.
+    The resume input of a run. Restoring is opt-in: only an explicit checkpoint
+    brings training back to a previous position, and the position itself is
+    read from that checkpoint. Unknown keys are rejected so that configs written
+    against the old auto-resume state machine fail instead of silently doing
+    nothing.
     """
 
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     checkpoint_file: str = Field(description="Path to model state checkpoint")
-    next_epoch_index: int = Field(description="The epoch to resume from")
-    next_batch_index: int = Field(description="The global batch counter to resume from")
-    migrate_embeddings: bool = Field(
-        default=False, description="Migrate an existing smaller number of embeddings"
-    )
-    rename_modules: bool = Field(
-        default=False,
-        description="Rename modules from existing models to new names",
-    )
-    resumed_from: str | None = Field(
+
+
+class ResumeMetadata(BaseModel):
+    """
+    The output-side record of where a run restored its state from. This is an
+    audit trail only: it is written to the output config and never accepted as
+    an input, so the checkpoint remains the single source of the cursor.
+    """
+
+    parent_checkpoint: str | None = Field(
         default=None,
-        description="If training has been resumed from a previous checkpoint/experiment, points to the config of that experiment to easily trace chained training runs",
+        description="The checkpoint this run was restored from, if any",
     )
 
 
@@ -207,7 +208,7 @@ class GenericOutputConfig(BaseModel, Generic[TModelParams, TTrainConfig, TIoConf
     params: TModelParams
     train: TTrainConfig
     io: TIoConfig
-    resume: ResumeConfig
+    resume: ResumeMetadata
     summary: SummaryStats
 
 

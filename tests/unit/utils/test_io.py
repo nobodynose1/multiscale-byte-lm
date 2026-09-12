@@ -10,19 +10,16 @@ from typing import NamedTuple
 import pytest
 import torch
 from pydantic import BaseModel
-from torch import nn
 
-from mblm import MBLM, MBLMModelConfig, TransformerBlock
-from mblm.model.embeddings import MBLM_TOKEN_EMB_MIGRATION
-from mblm.model.multi_stage_token_embedding import _StageTokenEmbedding
 from mblm.utils.io import (
     CSVWriter,
     NDJSONWriter,
     dump_yml,
-    load_model_state,
+    load_checkpoint_snapshot,
     load_yml,
+    read_checkpoint_cursor,
     read_jsonl,
-    save_model_state,
+    save_training_checkpoint_state,
 )
 
 # TODO: Python 3.12, assert_type
@@ -83,231 +80,39 @@ class TestCSVWriter:
                     assert list(map(str, range(10))) == sorted(indexes)
 
 
-class TestModelCheckpointing:
-    class Model(torch.nn.Module):  # noqa
-        def __init__(self, num_embs: int, emb_dim: int):
-            super().__init__()
-            self.emb = torch.nn.Embedding(num_embs, emb_dim)
-            self.seq = torch.nn.Sequential(
-                torch.nn.Embedding(num_embs, emb_dim),
-                torch.nn.Linear(emb_dim, num_embs),
-            )
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            _ = self.emb(x)
-            return self.seq(x)
-
-    class OldModel(torch.nn.Module):  # noqa
-        def __init__(self):
-            super().__init__()
-            self.keep = torch.nn.Parameter(torch.randn((1, 1)))
-            self.old_param = torch.nn.Parameter(torch.ones((1, 1)))
-            self.old_param_x = torch.nn.Parameter(torch.ones((1, 1)))
-
-    class NewModel(torch.nn.Module):  # noqa
-        def __init__(self):
-            super().__init__()
-            self.keep = torch.nn.Parameter(torch.randn((1, 1)))
-            self.new_param = torch.nn.Parameter(torch.zeros((1, 1)))
-            self.new_param_x = torch.nn.Parameter(torch.zeros((1, 1)))
-
-    @pytest.mark.parametrize(
-        "src_emb_size,tgt_emb_size",
-        [
-            (4, 4),  # same size
-            (2, 3),  # slightly larger
-            (4, 10),  # much larger
-        ],
-    )
-    @torch.no_grad()
-    def test_load_map_state(self, src_emb_size: int, tgt_emb_size: int):
-        assert src_emb_size <= tgt_emb_size, "Invalid test"
-
-        model_src = self.Model(src_emb_size, 3)
-        model_tgt = self.Model(tgt_emb_size, 3)
+class TestCheckpointCursor:
+    def test_a_written_cursor_is_read_back_from_the_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            _, chkpoint = save_model_state(tmpdir, "checkpoint", model_src, 0)
-            model_tgt, _ = load_model_state(
-                chkpoint,
-                model_tgt,
-                map_extend_embeddings={
-                    "emb.weight",
-                    "seq.0.weight",
-                    "seq.1.weight",
-                    "seq.1.bias",
-                },
+            _, checkpoint = save_training_checkpoint_state(
+                tmpdir,
+                "latest",
+                model=torch.nn.Linear(2, 2),
+                loss=1.5,
+                epoch=3,
+                batch=7,
+                cum_batch=42,
             )
-        assert model_tgt.emb.weight.size(0) == tgt_emb_size
-        assert model_tgt.emb.weight[:src_emb_size].equal(model_src.emb.weight)
-        assert model_tgt.seq[1].weight[:src_emb_size].equal(model_src.seq[1].weight)
-        assert model_tgt.seq[1].bias[:src_emb_size].equal(model_src.seq[1].bias)
+            snapshot = load_checkpoint_snapshot(checkpoint)
 
-        # make sure that the first part of the logits is equal
-        max_token_id = src_emb_size - 1
-        input_both = torch.tensor([max_token_id]).long()
-        src_logits = model_src.forward(input_both)
-        tgt_logits = model_tgt.forward(input_both)
+        cursor = read_checkpoint_cursor(snapshot)
+        assert (cursor.epoch, cursor.batch, cursor.cum_batch) == (3, 7, 42)
 
-        assert tgt_logits[:, :src_emb_size].equal(src_logits)
+    @pytest.mark.parametrize("missing", ["EPOCH", "BATCH", "CUM_BATCH"])
+    def test_a_missing_cursor_entry_is_rejected(self, missing: str):
+        snapshot = {"EPOCH": 1, "BATCH": 2, "CUM_BATCH": 3}
+        snapshot.pop(missing)
 
-    @torch.no_grad()
-    def test_load_map_state_mbml(self):
-        def create_model(num_tokens: int):
-            return MBLM(
-                MBLMModelConfig(
-                    num_tokens=num_tokens,
-                    pad_token_id=0,
-                    hidden_dims=(1024, 512),
-                    num_layers=(1, 1),
-                    seq_lens=(8192, 8),
-                    train_checkpoint_chunks=None,
-                    block=TransformerBlock(
-                        attn_head_dims=64,
-                        attn_num_heads=8,
-                        attn_use_rot_embs=True,
-                        pos_emb_type=None,
-                    ),
-                )
-            )
+        with pytest.raises(ValueError, match=missing):
+            read_checkpoint_cursor(snapshot)
 
-        num_src_emb, num_tgt_emb = 5, 6
-        pad_id = 0
+    @pytest.mark.parametrize("value", [True, "3", 1.5, None])
+    def test_a_non_integer_cursor_entry_is_rejected(self, value):
+        with pytest.raises(ValueError, match="BATCH"):
+            read_checkpoint_cursor({"EPOCH": 1, "BATCH": value, "CUM_BATCH": 3})
 
-        model_src = create_model(num_src_emb)
-        model_tgt = create_model(num_tgt_emb)
-
-        # Assert updated structure
-        assert isinstance(model_src.token_embs_rev[0], _StageTokenEmbedding)
-        assert isinstance(model_src.token_embs_rev[1], _StageTokenEmbedding)
-        assert isinstance(model_tgt.token_embs_rev[0], _StageTokenEmbedding)
-        assert isinstance(model_tgt.token_embs_rev[1], _StageTokenEmbedding)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, chkpoint = save_model_state(tmpdir, "checkpoint", model_src, 0)
-            model_tgt, _ = load_model_state(
-                chkpoint,
-                model_tgt,
-                map_extend_embeddings=MBLM_TOKEN_EMB_MIGRATION,
-            )
-
-            # Extract embeddings (new layout: embedding lives at .embedding)
-            src_stage0_emb: nn.Embedding = model_src.token_embs_rev[0].embedding
-            src_stage1_emb: nn.Embedding = model_src.token_embs_rev[1].embedding
-            tgt_stage0_emb: nn.Embedding = model_tgt.token_embs_rev[0].embedding
-            tgt_stage1_emb: nn.Embedding = model_tgt.token_embs_rev[1].embedding
-
-            # Sizes grew
-            assert tgt_stage0_emb.num_embeddings == num_tgt_emb
-            assert tgt_stage1_emb.num_embeddings == num_tgt_emb
-            assert model_tgt.to_logits.weight.size(0) == num_tgt_emb
-            assert model_tgt.to_logits.bias.size(0) == num_tgt_emb
-
-            # === Functional equality for old token ids (skip pad if migration handles it specially) ===
-            # Compare the result of embedding lookups rather than raw weight slicing.
-            old_token_ids = torch.arange(num_src_emb, dtype=torch.long)
-            non_pad_ids = old_token_ids[old_token_ids != pad_id]
-            assert non_pad_ids.numel() > 0, "Expected at least one non-pad id in source vocab"
-
-            # Stage 0 (local) functional check
-            src_s0_vecs = src_stage0_emb(non_pad_ids)  # [K, D0]
-            tgt_s0_vecs = tgt_stage0_emb(non_pad_ids)  # [K, D0]
-            assert torch.allclose(
-                tgt_s0_vecs, src_s0_vecs, atol=0, rtol=0
-            ), "Stage-0 embeddings differ for existing token ids"
-
-            # Stage 1 (global) functional check (embedding part only)
-            src_s1_vecs = src_stage1_emb(non_pad_ids)  # [K, D1]
-            tgt_s1_vecs = tgt_stage1_emb(non_pad_ids)  # [K, D1]
-            assert torch.allclose(
-                tgt_s1_vecs, src_s1_vecs, atol=0, rtol=0
-            ), "Stage-1 embeddings differ for existing token ids"
-
-            # === Logits preservation for old ids ===
-            assert torch.allclose(
-                model_tgt.to_logits.weight[:num_src_emb], model_src.to_logits.weight, atol=0, rtol=0
-            ), "to_logits.weight rows for old ids not preserved"
-            assert torch.allclose(
-                model_tgt.to_logits.bias[:num_src_emb], model_src.to_logits.bias, atol=0, rtol=0
-            ), "to_logits.bias rows for old ids not preserved"
-
-            # === New token id should be accepted only by the migrated model ===
-            max_new_token_id = num_tgt_emb - 1
-            input_for_tgt_model_only = torch.tensor([[max_new_token_id]], dtype=torch.long)
-
-            with pytest.raises(Exception):
-                model_src.forward(input_for_tgt_model_only)
-
-            try:
-                model_tgt.forward(input_for_tgt_model_only)
-            except Exception as error:
-                pytest.fail(f"Forward pass should work: {error}")
-
-    @pytest.mark.parametrize("rename_from,rename_to", [("old_param", "new_param")])
-    def test_load_map_state_rename(self, rename_from: str, rename_to: str):
-        new_model = self.NewModel()
-        old_model = self.OldModel()
-        assert not new_model.new_param.all()  # before migration
-        assert old_model.old_param.all()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, chkpoint = save_model_state(tmpdir, "checkpoint", old_model, 0)
-
-            new_model, _ = load_model_state(
-                chkpoint,
-                new_model,
-                map_rename_modules=((rename_from, rename_to),),
-            )
-
-            assert new_model.new_param.equal(old_model.old_param)
-            # make sure all modules with prefix are renamed
-            assert new_model.new_param_x.equal(old_model.old_param_x)
-
-    @pytest.mark.parametrize(
-        "src_emb_size,tgt_emb_size,src_emb_dim,tgt_emb_dim,err_msg",
-        [
-            (3, 2, 4, 4, "Mapping to a smaller number of embeddings"),  # shrinking
-            (3, 3, 4, 5, "Mapping to a smaller embedding dimension"),  # incompatible emb dim
-        ],
-    )
-    def test_load_map_state_unsupported_mapping(
-        self,
-        src_emb_size: int,
-        tgt_emb_size: int,
-        src_emb_dim: int,
-        tgt_emb_dim: int,
-        err_msg: str,
-    ):
-        src_mod = self.Model(src_emb_size, src_emb_dim)
-        tgt_mod = self.Model(tgt_emb_size, tgt_emb_dim)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, chkpoint = save_model_state(tmpdir, "checkpoint", src_mod, 0)
-            with pytest.raises(ValueError) as exc_info:
-                load_model_state(
-                    chkpoint,
-                    tgt_mod,
-                    map_extend_embeddings={
-                        "emb.weight",
-                        "seq.0.weight",
-                        "seq.1.weight",
-                        "seq.1.bias",
-                    },
-                )
-
-            assert err_msg in str(exc_info.value)
-
-    def test_load_map_state_unsupported_different_modules(self):
-        src_mod = self.OldModel()
-        tgt_mod = self.NewModel()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _, chkpoint = save_model_state(tmpdir, "checkpoint", src_mod, 0)
-            with pytest.raises(ValueError) as exc_info:
-                load_model_state(
-                    chkpoint,
-                    tgt_mod,
-                    map_extend_embeddings={"keep"},
-                )
-
-            assert "Expected source and target state dict to match" in str(exc_info.value)
+    def test_a_negative_cursor_entry_is_rejected(self):
+        with pytest.raises(ValueError, match="negative"):
+            read_checkpoint_cursor({"EPOCH": -1, "BATCH": 0, "CUM_BATCH": 0})
 
 
 class TestNDJSONWriter:
