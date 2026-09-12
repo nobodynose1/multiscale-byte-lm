@@ -46,8 +46,25 @@ class TestMisc:
 
         retry_wrapper = retry(num_retries=n_retries, on_error=on_error_stub)
         func = retry_wrapper(try_func.run)
-        result = func()
 
-        assert result is expected_result
+        if expected_result is None:
+            # exhausted retries re-raise the last failure instead of returning it
+            with pytest.raises(Exception, match="error"):
+                func()
+        else:
+            assert func() is expected_result
+
         assert try_func_spy.call_count == expected_calls
         assert on_error_stub.call_count == min(n_inner_fails, n_retries + 1)
+
+    def test_exhausted_retries_raise_the_last_failure(self):
+        attempts: list[int] = []
+
+        def always_fails() -> None:
+            attempts.append(len(attempts) + 1)
+            raise ValueError(f"attempt {len(attempts)}")
+
+        with pytest.raises(ValueError, match="attempt 3"):
+            retry(num_retries=2)(always_fails)()
+
+        assert attempts == [1, 2, 3]

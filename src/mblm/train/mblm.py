@@ -22,6 +22,7 @@ SOFTWARE."""
 
 import math
 import os
+import sys
 from abc import abstractmethod
 from typing import Any, Callable, Iterator, Protocol, TypeVar
 
@@ -333,6 +334,7 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
     except Exception as error:
         log.fatal(error, exc_info=True)
         shutdown_log_handlers()
+        sys.exit(1)
 
 
 def train_mblm(config: TrainEntryConfig) -> None:
@@ -377,6 +379,7 @@ def train_mblm(config: TrainEntryConfig) -> None:
     except Exception as error:
         log.fatal(error, exc_info=True)
         shutdown_log_handlers()
+        sys.exit(1)
 
 
 class MaskedTrainer(

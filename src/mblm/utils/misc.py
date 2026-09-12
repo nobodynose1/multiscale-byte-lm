@@ -30,21 +30,23 @@ def retry(
     num_retries: int,
     on_error: Callable[[Exception, int], Any] | None = None,
 ):
-    """Retry a function `n` times. The function is called at maximum `n` times"""
+    """Retry a function `n` times. The function is called at maximum `n` times.
+    When every attempt fails, the failure of the last attempt is re-raised, so
+    exhausted retries never turn a failure into a normal return."""
     assert num_retries >= 0, "num_retries must be non-negative"
 
-    def wrapper(f: Callable[P, T]) -> Callable[P, T | None]:
-        def inner(*args: P.args, **kwargs: P.kwargs) -> T | None:
+    def wrapper(f: Callable[P, T]) -> Callable[P, T]:
+        def inner(*args: P.args, **kwargs: P.kwargs) -> T:
             attempted_retries = 0
-            while attempted_retries <= num_retries:
+            while True:
                 try:
                     return f(*args, **kwargs)
                 except Exception as err:
                     if on_error:
                         on_error(err, num_retries - attempted_retries)
                     attempted_retries += 1
-
-            return None
+                    if attempted_retries > num_retries:
+                        raise
 
         return inner
 

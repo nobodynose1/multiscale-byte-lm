@@ -1190,6 +1190,20 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                 self._log.fatal(
                     f"Mismatch between expected and actual elements seen: {expected_local_elements}, {elements_seen_total}"
                 )
+            if completed_optimizer_steps == 0 and cumulative_batch_idx_start < local_batch_iters:
+                # a run that ends without a single optimizer step has trained
+                # nothing; only a resume cursor that already reached the target
+                # is a legitimate zero-step run
+                self._log.fatal(
+                    "Finished training without a single optimizer step: "
+                    f"{local_batch_iters} batch iterations, gradient accumulation of "
+                    f"{train_conf.gradient_accumulate_every}"
+                )
+                raise RuntimeError(
+                    "the run finished without a single optimizer step: "
+                    f"batch_iterations={local_batch_iters}, "
+                    f"gradient_accumulate_every={train_conf.gradient_accumulate_every}"
+                )
             self._log.info("Finished training")
             self._log.info(f"Stats (local): Elements seen: {elements_seen_total}")
             if last_successful_optimizer_step:
