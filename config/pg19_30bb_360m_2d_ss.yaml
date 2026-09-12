@@ -19,6 +19,7 @@ params:
     d_conv: 4
     expand: 2
     headdim: 64
+    mamba_backend: mamba2
     pos_emb_type: null
 train:
   target_elements: 30_000_000_000

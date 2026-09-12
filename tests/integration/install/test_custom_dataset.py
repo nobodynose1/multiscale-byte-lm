@@ -107,6 +107,7 @@ config = TrainEntryConfig(
                 d_conv=4,
                 expand=2,
                 headdim=64,
+                mamba_backend="mamba1",
                 pos_emb_type=None,
             ),
             TransformerBlock(

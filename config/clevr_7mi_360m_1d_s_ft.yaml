@@ -35,6 +35,7 @@ params:
     expand: 2
     headdim: 64
     dropout: 0.1
+    mamba_backend: mamba2
     pos_emb_type: null
 train:
   target_elements: 7_000_000

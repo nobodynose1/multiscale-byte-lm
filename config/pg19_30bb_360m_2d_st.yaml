@@ -19,6 +19,7 @@ params:
       d_conv: 4
       expand: 2
       headdim: 64
+      mamba_backend: mamba2
       pos_emb_type: null
     - attn_head_dims: 64
       attn_num_heads: 16

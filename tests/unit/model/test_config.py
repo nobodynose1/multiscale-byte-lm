@@ -29,7 +29,9 @@ block_encoder = TransformerEncoderBlock(
     attn_use_rot_embs=True,
     use_flash_attn=True,
 )
-block_mamba = MambaBlock(d_conv=4, d_state=128, expand=2, headdim=64, pos_emb_type=None)
+block_mamba = MambaBlock(
+    d_conv=4, d_state=128, expand=2, headdim=64, pos_emb_type=None, mamba_backend="mamba2"
+)
 
 TEST_BLOCK_CONFIGS: list[StageBlock | list[StageBlock]] = [
     block_mamba,

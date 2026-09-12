@@ -37,6 +37,7 @@ from mblm.data.datasets import DistributedDataset
 from mblm.data.types import BatchMaskedForMLM, BatchWithLossMask, ModelMode
 from mblm.model.config import MBLMEncoderModelConfig, MBLMModelConfig, MBLMReturnType
 from mblm.model.embeddings import MBLM_TOKEN_EMB_MIGRATION
+from mblm.model.mamba_admission import run_mamba_admission, write_mamba_impl_marker
 from mblm.model.mblm import MBLM, MBLMEncoder
 from mblm.model.utils import count_params
 from mblm.train.core.config import (
@@ -297,6 +298,7 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
     log = create_logger(__name__, log_dir=config.io.output_dir)
     try:
         with process_group(backend="gloo") as run_vars:
+            admission = run_mamba_admission(config.params, run_vars=run_vars)
             dataset = masked_dataset_registry.retrieve(config.io.dataset_id)
             train_dataset = dataset.from_train_entry_config(
                 config=config,
@@ -311,6 +313,8 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
                 num_workers=1,
             )
             trainer = MaskedTrainer(config, run_vars=run_vars)
+            if torch.distributed.get_rank() == 0:
+                write_mamba_impl_marker(trainer.output_dir, admission)
             best_model = trainer.train(train_dataset, eval_dataset)
             if best_model and dataset.supports_test_mode():
                 test_dataset = dataset.from_train_entry_config(
@@ -328,6 +332,7 @@ def train_mblm(config: TrainEntryConfig) -> None:
 
     try:
         with process_group(backend="nccl") as run_vars:
+            admission = run_mamba_admission(config.params, run_vars=run_vars)
             dataset = dataset_registry.retrieve(config.io.dataset_id)
 
             train_dataset = dataset.from_train_entry_config(
@@ -344,6 +349,8 @@ def train_mblm(config: TrainEntryConfig) -> None:
             )
 
             trainer = MegabyteTrainer(config, run_vars=run_vars)
+            if torch.distributed.get_rank() == 0:
+                write_mamba_impl_marker(trainer.output_dir, admission)
             best_model = trainer.train(train_dataset, valid_dataset)
 
             supports_test_mode = dataset.supports_test_mode()

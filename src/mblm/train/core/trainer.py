@@ -400,6 +400,13 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         """
         return f"{time():.0f}"
 
+    @property
+    def output_dir(self) -> Path:
+        """
+        The directory this run writes its artefacts to.
+        """
+        return self._output_dir
+
     def migrate_embeddings_if_enabled(self) -> set[str] | None:
         """
         When resuming training from a model, a smaller number of embeddings can

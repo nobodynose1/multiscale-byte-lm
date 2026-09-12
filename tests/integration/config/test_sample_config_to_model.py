@@ -5,8 +5,11 @@ import pytest
 
 from mblm import MBLM, MambaBlock, MBLMModelConfig, TransformerBlock
 from mblm.data.dataset.clevr import ClevrOptionalArgs
+from mblm.model.mamba_admission import probe_mamba_backend, run_mamba_admission
+from mblm.model.mamba_shim import MambaBackendUnavailableError
 from mblm.model.transformer import TransformerEncoderBlock
 from mblm.train.mblm import TrainEntryConfig
+from mblm.utils.distributed import ElasticRunVars
 from mblm.utils.io import load_yml
 
 CONFIG_FILES_DIR = "config"
@@ -38,20 +41,36 @@ class TestConfigToModel:
             elif isinstance(b, TransformerEncoderBlock):
                 assert b.block_type == "transformerEncoder"
             else:
-                # mamba1, can be mamba2 (only if tested on Linux with mamba_ssm installed)
-                assert b.block_type.startswith("mamba")
+                # the engine is declared by the config, not decided by import order
+                assert b.mamba_backend in ("mamba1", "mamba2")
 
-        _ = MBLM(
-            MBLMModelConfig(
-                num_tokens=config.params.num_tokens,
-                hidden_dims=config.params.hidden_dims,
-                seq_lens=config.params.seq_lens,
-                num_layers=config.params.num_layers,
-                pad_token_id=config.params.pad_token_id,
-                train_checkpoint_chunks=config.params.train_checkpoint_chunks,
-                block=config.params.block,
-            )
+        model_config = MBLMModelConfig(
+            num_tokens=config.params.num_tokens,
+            hidden_dims=config.params.hidden_dims,
+            seq_lens=config.params.seq_lens,
+            num_layers=config.params.num_layers,
+            pad_token_id=config.params.pad_token_id,
+            train_checkpoint_chunks=config.params.train_checkpoint_chunks,
+            block=config.params.block,
         )
+
+        state = probe_mamba_backend(config.params)
+        if state.required and not state.ok:
+            # a declared engine that is not installed fails the run instead of
+            # being silently replaced by the other engine
+            with pytest.raises(MambaBackendUnavailableError):
+                MBLM(model_config)
+            return None
+
+        run_mamba_admission(
+            config.params, run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+        )
+        _ = MBLM(model_config)
+
+        for b in config.params.stage_blocks():
+            if isinstance(b, MambaBlock):
+                # the runtime engine is the admitted one
+                assert b.block_type == b.mamba_backend
         return None
 
     @pytest.mark.parametrize("config_files", CONFIG_FILES)
