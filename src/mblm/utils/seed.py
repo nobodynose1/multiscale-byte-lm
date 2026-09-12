@@ -30,3 +30,17 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def seed_run(base_seed: int | None, *, rank: int) -> int | None:
+    """
+    Seed this rank's RNG streams from the run's base seed. The effective seed is
+    derived from the global rank so that ranks do not share one RNG stream.
+    Returns the effective seed of this rank, or `None` when the run declares no
+    base seed and therefore keeps its RNG streams untouched.
+    """
+    if base_seed is None:
+        return None
+    effective_seed = base_seed + rank
+    seed_everything(effective_seed)
+    return effective_seed

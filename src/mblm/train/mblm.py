@@ -51,6 +51,7 @@ from mblm.train.core.config import (
 from mblm.train.core.trainer import CoreTrainer
 from mblm.utils.distributed import process_group
 from mblm.utils.logging import create_logger, shutdown_log_handlers
+from mblm.utils.seed import seed_run
 
 
 class TrainMBLMParams(MBLMModelConfig, CoreModelParams):
@@ -299,6 +300,9 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
     try:
         with process_group(backend="gloo") as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
+            effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
+            if effective_seed is not None:
+                log.info(f"Effective seed: {effective_seed}")
             dataset = masked_dataset_registry.retrieve(config.io.dataset_id)
             train_dataset = dataset.from_train_entry_config(
                 config=config,
@@ -333,6 +337,9 @@ def train_mblm(config: TrainEntryConfig) -> None:
     try:
         with process_group(backend="nccl") as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
+            effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
+            if effective_seed is not None:
+                log.info(f"Effective seed: {effective_seed}")
             dataset = dataset_registry.retrieve(config.io.dataset_id)
 
             train_dataset = dataset.from_train_entry_config(

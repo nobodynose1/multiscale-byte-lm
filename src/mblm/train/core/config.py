@@ -48,6 +48,10 @@ class CoreTrainConfig(BaseModel):
     `CoreTrainer`.
     """
 
+    seed: int | None = Field(
+        default=None,
+        description="The base seed of the run. When set, every rank seeds its RNG streams with this base seed plus its global rank, before any model or dataset is built. `None` keeps the current behaviour of an unseeded run",
+    )
     target_elements: int = Field(
         description="The desired number of data points to train on. If `None`, defaults to using data points from the training set once, resulting in a single epoch. Note that this is a *lower bound* - due to the sequence length and batch sizes, in effect, we train on more than this target. Use this when you want to train on a fixed subset of data, e.g., a number of bytes"
     )
