@@ -298,7 +298,7 @@ class AttendWithMask(Attend):
             flash and version.parse(torch.__version__) < version.parse("2.0.0")
         ), "in order to use flash attention, you must be using pytorch 2.0 or above"
 
-        # default cpu attention configs
+        # attention backends offered to torch SDPA; it picks the one the current device supports
         self.attn_cfg = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.MATH,
@@ -308,16 +308,10 @@ class AttendWithMask(Attend):
         if not torch.cuda.is_available() or not flash:
             return
 
-        device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
-
-        if device_properties.major == 8 and device_properties.minor == 0:
-            print_once("A100 GPU detected, using flash attention if input tensor is on cuda")
-            self.attn_cfg = [SDPBackend.FLASH_ATTENTION]
-        else:
-            print_once(
-                "Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda"
-            )
-            self.attn_cfg = [SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]
+        print_once(
+            "Flash attention requested, keeping every SDPA backend as a candidate "
+            "so that it is picked when the device supports it"
+        )
 
     def get_mask(self, i, j, device):
         return torch.ones((i, j), device=device, dtype=torch.bool).triu(j - i + 1)
