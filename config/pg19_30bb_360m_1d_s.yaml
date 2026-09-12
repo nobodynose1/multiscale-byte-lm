@@ -26,6 +26,7 @@ params:
     mamba_backend: mamba2
     pos_emb_type: null
 train:
+  seed: 42
   target_elements: 30_000_807_936
   target_elements_strategy: sequence
   batch_size: 2

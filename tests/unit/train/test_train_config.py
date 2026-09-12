@@ -1,9 +1,12 @@
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from mblm.train.core.config import CoreTrainConfig
+from mblm.train.mblm import TrainEntryConfig
+from mblm.utils.io import load_yml
 
 
 def train_config(**overrides: Any) -> CoreTrainConfig:
@@ -31,3 +34,30 @@ class TestDistributedTimeoutSeconds:
     def test_a_non_positive_timeout_is_rejected(self, invalid: int):
         with pytest.raises(ValidationError):
             train_config(distributed_timeout_seconds=invalid)
+
+
+DUAL_LINE_CONFIGS = (
+    Path("config/pg19_30bb_360m_1d_s.yaml"),
+    Path("config/pg19_30bb_360m_1d_t.yaml"),
+)
+
+
+def dual_line_seeds() -> dict[str, int | None]:
+    return {
+        config_path.name: load_yml(config_path, parse_to=TrainEntryConfig).train.seed
+        for config_path in DUAL_LINE_CONFIGS
+    }
+
+
+class TestDualLineBaseSeed:
+    def test_both_lines_declare_a_base_seed(self):
+        seeds = dual_line_seeds()
+
+        assert all(
+            seed is not None for seed in seeds.values()
+        ), f"a dual line does not declare train.seed: {seeds}"
+
+    def test_the_two_lines_declare_the_same_base_seed(self):
+        seeds = dual_line_seeds()
+
+        assert len(set(seeds.values())) == 1, f"the dual lines disagree on the base seed: {seeds}"
