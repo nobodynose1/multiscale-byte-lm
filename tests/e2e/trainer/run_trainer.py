@@ -1,6 +1,8 @@
 import math
 import os
+import sys
 import warnings
+from datetime import timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore", module="mblm.model.mamba_shim", category=UserWarning)
@@ -20,10 +22,11 @@ from mblm.train.core.config import (
     CoreTrainConfig,
     GenericEntryConfig,
 )
+from mblm.train.core.startup import STAGE_DATASETS, required_stage, start_trainer
 from mblm.train.core.trainer import CoreTrainer, CoreTrainerOptions
 from mblm.utils.distributed import process_group
 from mblm.utils.io import load_yml
-from mblm.utils.logging import create_logger
+from mblm.utils.logging import create_logger, shutdown_log_handlers
 from mblm.utils.seed import seed_everything
 
 # TODO: Python 3.12, assert_type
@@ -147,22 +150,24 @@ def run(config: TrainEntryConfig) -> None:
     log.info("Initiating distributed training")
 
     try:
-        with process_group(backend="gloo") as run_vars:
-            train_dataset = SineDataset(
-                NUM_TRAIN_ELEMENTS,
-                worker_id=run_vars.local_rank,
-                num_workers=run_vars.world_size,
-            )
-            valid_dataset = SineDataset(
-                100,
-                worker_id=0,
-                num_workers=1,
-            )
-            test_dataset = SineDataset(
-                100,
-                worker_id=0,
-                num_workers=1,
-            )
+        timeout = timedelta(seconds=config.train.distributed_timeout_seconds)
+        with process_group(backend="gloo", timeout=timeout) as run_vars:
+            with required_stage(STAGE_DATASETS, world_size=run_vars.world_size):
+                train_dataset = SineDataset(
+                    NUM_TRAIN_ELEMENTS,
+                    worker_id=run_vars.local_rank,
+                    num_workers=run_vars.world_size,
+                )
+                valid_dataset = SineDataset(
+                    100,
+                    worker_id=0,
+                    num_workers=1,
+                )
+                test_dataset = SineDataset(
+                    100,
+                    worker_id=0,
+                    num_workers=1,
+                )
             trainer = TestTrainer(
                 config,
                 run_vars=run_vars,
@@ -171,11 +176,14 @@ def run(config: TrainEntryConfig) -> None:
                     display_progress=False,
                 ),
             )
+            start_trainer(trainer, world_size=run_vars.world_size)
             best_model = trainer.train(train_dataset, valid_dataset)
             if best_model:
                 trainer.test(test_dataset, best_model)
     except Exception as error:
-        log.fatal(error)
+        log.fatal(error, exc_info=True)
+        shutdown_log_handlers()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

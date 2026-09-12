@@ -16,6 +16,7 @@ from mblm.train.core.config import (
     CoreTrainConfig,
     GenericEntryConfig,
 )
+from mblm.train.core.startup import start_trainer
 from mblm.train.core.trainer import CoreTrainer, CoreTrainerOptions
 from mblm.utils.distributed import ElasticRunVars
 
@@ -117,7 +118,7 @@ class TrainerHarness:
     def __init__(self, mocker: MockerFixture, tmp_path: Path, calls: TrainCalls) -> None:
         self.log = RecordingLogger()
         self.dump_output_config = mocker.patch.object(TinyTrainer, "_dump_output_config")
-        mocker.patch.object(TinyTrainer, "_create_output_dir", lambda _self, _io: tmp_path)
+        mocker.patch.object(TinyTrainer, "create_output_dir", lambda _self: str(tmp_path))
         mocker.patch.object(
             TinyTrainer, "configure_logger", lambda _self, *_args, **_kwargs: self.log
         )
@@ -125,9 +126,10 @@ class TrainerHarness:
         mocker.patch.object(TinyTrainer, "_train", calls)
         self.trainer = TinyTrainer(
             entry_config(tmp_path),
-            run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False),
+            run_vars=ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False),
             options=CoreTrainerOptions(display_progress=False),
         )
+        start_trainer(self.trainer, world_size=1)
         self.dataset = FakeDataset()
 
     def run(self) -> TinyModel | None:

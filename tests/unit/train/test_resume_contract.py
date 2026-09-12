@@ -22,6 +22,7 @@ from mblm.train.core.config import (
     ResumeMetadata,
     SummaryStats,
 )
+from mblm.train.core.startup import start_trainer
 from mblm.train.core.trainer import CoreTrainer
 from mblm.utils.distributed import ElasticRunVars
 from mblm.utils.io import CheckpointCursor, save_training_checkpoint_state
@@ -134,15 +135,41 @@ def entry_config(tmp_path: Path, *, resume: ResumeConfig | None = None) -> TinyE
 
 
 def build_trainer(mocker: MockerFixture, tmp_path: Path, config: TinyEntryConfig) -> TinyTrainer:
-    mocker.patch.object(TinyTrainer, "_create_output_dir", lambda _self, _io: tmp_path)
+    mocker.patch.object(TinyTrainer, "create_output_dir", lambda _self: str(tmp_path))
     mocker.patch.object(
         TinyTrainer, "configure_logger", lambda _self, *_args, **_kwargs: SilentLogger()
     )
     mocker.patch.object(TinyTrainer, "_init_distributed_model", lambda _self, model: model)
-    return TinyTrainer(
+    trainer = TinyTrainer(
         config,
-        run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False),
+        run_vars=ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False),
     )
+    start_trainer(trainer, world_size=1)
+    return trainer
+
+
+def save_complete_checkpoint(
+    path: Path, *, loss: float, epoch: int, batch: int, cum_batch: int
+) -> Path:
+    """
+    Write a checkpoint carrying the whole training state, which is the only
+    kind of file a run accepts as a resume point.
+    """
+    model = TinyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=10, power=1.0)
+    return save_training_checkpoint_state(
+        path.parent,
+        path.stem,
+        model=model,
+        loss=loss,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        grad_scaler=torch.GradScaler(device="cpu"),
+        epoch=epoch,
+        batch=batch,
+        cum_batch=cum_batch,
+    )[1]
 
 
 def read_dumped_config(tmp_path: Path) -> dict[str, Any]:
@@ -179,6 +206,20 @@ class TestResumeInputContract:
         payload["train"]["not_a_train_option"] = 1
 
         with pytest.raises(ValidationError, match="not_a_train_option"):
+            TinyEntryConfig.model_validate(payload)
+
+    def test_the_deleted_loss_log_gate_fails_to_parse(self):
+        payload = entry_payload()
+        payload["io"]["enabled_loss_log_for_gpus"] = True
+
+        with pytest.raises(ValidationError, match="enabled_loss_log_for_gpus"):
+            TinyEntryConfig.model_validate(payload)
+
+    def test_an_unknown_io_key_fails_to_parse(self):
+        payload = entry_payload()
+        payload["io"]["not_an_io_option"] = 1
+
+        with pytest.raises(ValidationError, match="not_an_io_option"):
             TinyEntryConfig.model_validate(payload)
 
     def test_the_checkpoint_file_is_the_only_resume_key(self):
@@ -229,15 +270,8 @@ class TestResumeRuntimeContract:
         self, mocker: MockerFixture, tmp_path: Path
     ):
         checkpoint = tmp_path / "run1" / "latest.pth"
-        save_training_checkpoint_state(
-            checkpoint.parent,
-            "latest",
-            model=TinyModel(),
-            loss=4.5,
-            epoch=2,
-            batch=5,
-            cum_batch=17,
-        )
+        checkpoint.parent.mkdir(parents=True)
+        save_complete_checkpoint(checkpoint, loss=4.5, epoch=2, batch=5, cum_batch=17)
 
         trainer = build_trainer(
             mocker,

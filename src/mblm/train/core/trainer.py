@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from time import time
 from typing import Any, Generic, Iterator, Literal, Sequence, TypeVar, cast
+from uuid import uuid4
 
 import torch
 import torch.distributed as dist
@@ -42,7 +43,6 @@ from mblm.data.datasets import DistributedDataset
 from mblm.data.types import ModelMode
 from mblm.model.utils import count_params
 from mblm.train.core.config import (
-    CoreIoConfig,
     CSVLossEntry,
     CSVTimeAndMemSnapshotEntry,
     GenericEntryConfig,
@@ -54,6 +54,7 @@ from mblm.train.core.config import (
     TTrainConfig,
 )
 from mblm.train.core.iter import epoch_cycler
+from mblm.train.core.startup import STAGE_CHECKPOINT_SAVE, bootstrap_log, required_stage
 from mblm.utils.cuda import IS_BF16_AVAILABLE, cuda_memory_snapshot, cuda_properties
 from mblm.utils.distributed import ElasticRunVars
 from mblm.utils.io import (
@@ -62,13 +63,14 @@ from mblm.utils.io import (
     StateDict,
     dump_yml,
     load_training_checkpoint_state,
-    read_checkpoint_cursor,
-    restore_training_component_states,
     save_model_state,
     save_training_checkpoint_state,
 )
 from mblm.utils.logging import create_logger
 from mblm.utils.top_n import TopN
+
+FRESH = "fresh"
+RESUME = "resume"
 
 TModel = TypeVar("TModel", bound=torch.nn.Module)
 TBatch = TypeVar("TBatch", bound=torch.Tensor | Sequence[torch.Tensor])
@@ -113,23 +115,28 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
     # private var
     _local_rank: int
+    _global_rank: int
     _world_size: int
-    _is_main_worker: bool
+    _is_main_writer: bool
     _device: str
     _device_type: Literal["cuda", "cpu"]
     _is_cuda: bool
 
-    _model_dist: DistributedDataParallel
+    # the four components of a run, built by the startup stages
+    _model: TModel
+    _model_dist: TModel | DistributedDataParallel
+    _optimizer: Optimizer
+    _scheduler: LRScheduler
+    _grad_scaler: torch.GradScaler
 
-    # misc - created internally
-    _output_dir: Path
+    # misc - attached once the run owns an output directory
+    _output_dir: Path | None
     _resume_metadata: ResumeMetadata
     _running_summary_stats: SummaryStats
     _top_n_models: TopN[StateDict]
     _csv_loss_writer: CSVWriter[CSVLossEntry]
     _csv_timemem_writer: CSVWriter[CSVTimeAndMemSnapshotEntry]
     _log: logging.Logger
-    _resume_training_snapshot: StateDict | None
     _resume_cursor: CheckpointCursor | None
     _last_latest_checkpoint_step: int
     _last_latest_checkpoint_time: float
@@ -140,85 +147,163 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         run_vars: ElasticRunVars,
         options: CoreTrainerOptions | None = None,
     ):
+        """
+        Set up a trainer. Nothing is built and nothing is written here: the
+        startup stages (`build_model`, `build_training_components`,
+        `preflight_checkpoint`, `create_output_dir`, `initialize_outputs`) run
+        after the process group is up, so that no rank creates an artefact, or
+        enters a collective of its own, while another rank is still constructing.
+        """
         self.config = config
         self.options = options or CoreTrainerOptions()
-        self._resume_training_snapshot = None
         self._resume_cursor = None
         self._last_latest_checkpoint_step = 0
         self._last_latest_checkpoint_time = time()
         self._world_size = run_vars.world_size
         self._local_rank = run_vars.local_rank
+        # the global rank owns the shared artefacts; the local rank only picks
+        # this process' device and data shard
+        self._global_rank = run_vars.global_rank
+        self._is_main_writer = run_vars.global_rank == 0
         # used for sending tensors/models to a device
         self._device = f"cuda:{self._local_rank}" if run_vars.is_cuda else "cpu"
         # used for mixed-precision
         self._device_type = "cuda" if run_vars.is_cuda else "cpu"
         self._is_cuda = not self._device == "cpu"
-        self._is_main_worker = run_vars.local_rank == 0
 
-        self._output_dir = self._create_output_dir(config.io)
-
-        self._log = self.configure_logger(self._output_dir, self._is_main_worker)
+        self._output_dir = None
+        self._log = bootstrap_log()
         self._top_n_models = TopN(
             config.io.num_models_to_save,
             deep_copy=True,  # module state_dicts are references
         )
 
-        # the ranks of the gpus that should write to the csv loss file
-        gpu_rank_csv_loss = set(self.config.io.enabled_loss_log_for_gpus)
+    """ Startup stages """
+
+    def build_model(self) -> None:
+        """
+        Build the raw model for this rank and move it to its device.
+        """
+        self._model = self.init_model().to(self._device)
+
+    def local_batch_iters(self) -> int:
+        """
+        The number of micro-batches this rank trains on, derived from the
+        resolved training config and the world size. A data loader is never the
+        source of this number.
+        """
+        train_conf = self.config.train
+        local_target_elements = train_conf.target_elements // self._world_size
+        if train_conf.target_elements_strategy == "batch":
+            elements_per_batch = train_conf.batch_size
+        else:
+            elements_per_batch = train_conf.batch_size * self.config.params.input_seq_len
+        return math.ceil(local_target_elements / elements_per_batch)
+
+    def local_gradient_steps(self) -> int:
+        """
+        The number of optimizer steps this rank takes over the whole run.
+        """
+        return self.local_batch_iters() // self.config.train.gradient_accumulate_every
+
+    def build_training_components(self) -> None:
+        """
+        Wrap the model for distributed training and build the optimizer,
+        scheduler and gradient scaler around it.
+        """
+        self._validate_config()
+        self._model_dist = self._init_distributed_model(self._model)
+        self._optimizer = self.configure_optimizer(self._model_dist.parameters())
+        self._scheduler = self.configure_scheduler(self._optimizer, self.local_gradient_steps())
+        self._grad_scaler = torch.GradScaler(device=self._device_type)
+
+    def preflight_checkpoint(self) -> str:
+        """
+        Decide whether this run starts from scratch or restores an explicitly
+        configured checkpoint, and restore it into the already built model,
+        optimizer, scheduler and scaler.
+
+        A configured checkpoint must load completely: there is no partial
+        restore and no fallback to a fresh run. Restoring is decided solely by
+        the presence of `resume.checkpoint_file`; the run never looks for a
+        checkpoint on its own.
+
+        Returns:
+            str: `fresh` or `resume`
+        """
+        if self.config.resume is None:
+            self._log.info("Creating new model")
+            return FRESH
+
+        checkpoint_file = self.config.resume.checkpoint_file
+        self._log.info(f"Initiating model loading from checkpoint {checkpoint_file}")
+        cursor, model_loss = load_training_checkpoint_state(
+            checkpoint_file,
+            self._model,
+            optimizer=self._optimizer,
+            scheduler=self._scheduler,
+            grad_scaler=self._grad_scaler,
+            gradient_accumulate_every=self.config.train.gradient_accumulate_every,
+            map_location="cpu",
+            optimizer_device=self._device,
+        )
+        # the checkpoint carries the training position in full training state
+        self._resume_cursor = cursor
+        if model_loss is None:
+            self._log.warning(
+                f"Checkpoint {checkpoint_file} carries no loss, so nothing is added to "
+                "the model candidate board from it"
+            )
+        else:
+            # keep the restored model as a candidate so a run that only makes
+            # things worse does not lose the model it started from
+            self._top_n_models.add((model_loss, self._model.state_dict()))
+            self._log.info(f"Loaded model with loss {model_loss:.4f} from checkpoint")
+        self._log.info(
+            f"Resuming from epoch {cursor.epoch}, batch {cursor.batch}, "
+            f"cumulative micro-batch {cursor.cum_batch}"
+        )
+        return RESUME
+
+    def create_output_dir(self) -> str | None:
+        """
+        Create this run's unique output directory. Only the global rank 0
+        writer creates it; every other rank returns `None` and receives the
+        created path from the stage's unified outcome.
+        """
+        if not self._is_main_writer:
+            return None
+        run_id = self.configure_run_id()
+        output_dir = Path(self.config.io.output_dir) / f"{self.config.io.name_model}_{run_id}"
+        output_dir.mkdir(parents=True, exist_ok=False)
+        return str(output_dir)
+
+    def initialize_outputs(self, output_dir: str) -> None:
+        """
+        Attach this run's output artefacts to every rank. Only the global rank 0
+        writer creates or opens a file: every other rank gets a noop logger and
+        noop CSV writers.
+        """
+        self._output_dir = Path(output_dir)
+        self._log = self.configure_logger(self._output_dir, self._is_main_writer)
         self._csv_loss_writer = CSVWriter(
-            self._output_dir,
-            self.options.loss_file_name,
-            noop=self._local_rank not in gpu_rank_csv_loss,
+            self._output_dir, self.options.loss_file_name, noop=not self._is_main_writer
         )
         self._csv_timemem_writer = CSVWriter(
-            self._output_dir, self.options.timemem_file_name, noop=not self._is_main_worker
+            self._output_dir, self.options.timemem_file_name, noop=not self._is_main_writer
         )
-
-        assert config.io.validate_amount > 0, "Validate amount must be strictly positive"
-        assert config.io.num_models_to_save >= 0, "num_models_to_save cant be negative"
-        if config.io.num_models_to_save == 0:
-            self._log.warning("No model of this training will be saved!")
-
-        if config.io.validate_amount < config.io.num_models_to_save:
-            self._log.warning(
-                f"Validate amount ({config.io.validate_amount}) \
-                is less than number of models to save ({config.io.num_models_to_save}).\
-                Saving only {config.io.validate_amount} models"
-            )
-
-        model = self.init_model().to(self._device)
-        if config.resume:
-            self._log.info("Initiating model loading from checkpoint")
-            model, model_loss, self._resume_training_snapshot = load_training_checkpoint_state(
-                config.resume.checkpoint_file,
-                model,
-                map_location="cpu",
-            )
-            # the checkpoint carries the training position, so the loop never
-            # needs a config-provided cursor
-            self._resume_cursor = read_checkpoint_cursor(self._resume_training_snapshot)
-            # save the restored model to the top n to make sure we keep the best
-            # model from the previous run should we only make everything worse
-            # during this training
-            self._top_n_models.add((model_loss, model.state_dict()))
-            self._resume_training_snapshot.pop("MODEL", None)
-            self._log.info(f"Loaded model with loss {model_loss:.4f} from checkpoint")
-        else:
-            self._log.info("Creating new model")
-
-        self._model_dist = self._init_distributed_model(model)
 
         # the output config only records provenance; the cursor stays in the
         # checkpoint and is never written back to a config file
         self._resume_metadata = ResumeMetadata(
-            parent_checkpoint=config.resume.checkpoint_file if config.resume else None,
+            parent_checkpoint=self.config.resume.checkpoint_file if self.config.resume else None,
         )
         cuda_info = cuda_properties()
-        main_model_params, submodule_params = self.configure_count_parameters(model)
+        main_model_params, submodule_params = self.configure_count_parameters(self._model)
 
         self._running_summary_stats = SummaryStats(
             parameter_count=main_model_params,
-            num_workers=run_vars.world_size,
+            num_workers=self._world_size,
             cuda_devices=cuda_info.cuda_devices,
             training_start="",  # temporary, updated when training starts
             training_end="",  # temporary, updated when training ends
@@ -227,8 +312,44 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._dump_output_config()
         self._log.info("Trainer initialized successfully")
         self._log.info(f"Model parameters: {main_model_params}, ({submodule_params})")
-        self._log.info(f"Configuration: {config}")
+        self._log.info(f"Configuration: {self.config}")
         self._log.info(f"CUDA: {cuda_info}")
+
+    def share_test_model(self, model: TModel) -> TModel:
+        """
+        Distribute the state chosen for testing from the global rank 0 writer to
+        every rank, so that all ranks evaluate the same weights.
+
+        Choosing which state to test belongs to the caller; this only moves the
+        chosen state across ranks.
+        """
+        if self._world_size == 1:
+            return model
+        for tensor in model.state_dict().values():
+            dist.broadcast(tensor.data, src=0)
+        return model
+
+    def _validate_config(self) -> None:
+        assert self.config.io.validate_amount > 0, "Validate amount must be strictly positive"
+        assert self.config.io.num_models_to_save >= 0, "num_models_to_save cant be negative"
+        if self.config.io.num_models_to_save == 0:
+            self._log.warning("No model of this training will be saved!")
+
+        if self.config.io.validate_amount < self.config.io.num_models_to_save:
+            self._log.warning(
+                f"Validate amount ({self.config.io.validate_amount}) \
+                is less than number of models to save ({self.config.io.num_models_to_save}).\
+                Saving only {self.config.io.validate_amount} models"
+            )
+
+        accumulation = self.config.train.gradient_accumulate_every
+        batch_iters = self.local_batch_iters()
+        if batch_iters % accumulation != 0:
+            raise ValueError(
+                f"the run's {batch_iters} micro-batches are not a multiple of "
+                f"gradient_accumulate_every ({accumulation}): it would end with a "
+                "pending accumulation window"
+            )
 
     """ Abstract methods that must be implemented """
 
@@ -325,15 +446,17 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     def configure_run_id(self) -> str:
         """
         Set a unique identifier for this experiment. Used as postfix for the
-        output directory.
+        output directory. A run id is never shared: two runs started in the same
+        second, or pointed at the same parent directory, still get their own.
         """
-        return f"{time():.0f}"
+        return f"{time():.6f}-{uuid4().hex[:8]}"
 
     @property
     def output_dir(self) -> Path:
         """
         The directory this run writes its artefacts to.
         """
+        assert self._output_dir is not None, "the run has no output directory yet"
         return self._output_dir
 
     """ Utility functions  """
@@ -353,24 +476,11 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             return module.module
         return module
 
-    def _create_output_dir(self, io_config: CoreIoConfig) -> Path:
-        """
-        Create a unique output directory (only on main worker).
-        """
-        run_id = self.configure_run_id()
-        output_dir = Path(io_config.output_dir) / f"{io_config.name_model}_{run_id}"
-
-        # only the main worker should do i/o
-        if self._is_main_worker:
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        return output_dir
-
     def _dump_output_config(self):
         """
         Dump all config files to disk (only on main worker).
         """
-        if not self._is_main_worker:
+        if not self._is_main_writer:
             return
         # copy the config over into the output format
         output_config = GenericOutputConfig(
@@ -380,7 +490,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             resume=self._resume_metadata,
             summary=self._running_summary_stats,
         )
-        dump_yml(self._output_dir / self.options.config_file_name, output_config)
+        dump_yml(self.output_dir / self.options.config_file_name, output_config)
 
     def _write_csv_loss(
         self,
@@ -433,13 +543,13 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         num_written = 0
         num_overwritten = 0
         best_checkpoint = Path()
-        if not self._is_main_worker:
+        if not self._is_main_writer:
             return num_written, num_overwritten, best_checkpoint
 
         # save final n best models - best models are iterated first
         for idx, (loss, model_state) in enumerate(self._top_n_models):
             did_overwrite, checkpoint_path = save_model_state(
-                self._output_dir,
+                self.output_dir,
                 f"{self.config.io.name_model}_top{idx + 1}.pth",
                 model=model_state,
                 loss=loss,
@@ -457,15 +567,12 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             prefix = f"[{cumulative_batch_idx}] " if cumulative_batch_idx else ""
             self._log.debug(f"{prefix}CUDA memory: {snapshot}")
 
-    def _calc_logging_points(
-        self,
-        total_batch_iters: int,
-        start_batch_idx: int,
-    ) -> tuple[set[int], set[int]]:
+    def _calc_logging_points(self, total_batch_iters: int) -> tuple[set[int], set[int]]:
         """
-        Calculate the indices for logging the training loss and validate based
-        on the total amount of batch iterations and offset start batch index
-        (when resuming training)
+        Calculate the cumulative micro-batch counts to log the training loss and
+        run validation at. The counts number the completed micro-batches of the
+        run, so the first micro-batch of a run sits at 1 and a run that has
+        already completed `n` micro-batches never revisits a point below `n + 1`.
         """
         log_train_loss_amount = self.config.io.log_train_loss_amount
         if total_batch_iters < log_train_loss_amount:
@@ -485,56 +592,61 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             )
             validate_amount = total_batch_iters
         log_train_loss_idxs = set(
-            torch.linspace(
-                start_batch_idx,
-                start_batch_idx + total_batch_iters - 1,
-                log_train_loss_amount,
-            )
-            .long()
-            .tolist()
+            torch.linspace(1, total_batch_iters, log_train_loss_amount).long().tolist()
         )
         run_valid_interval_idxs = set(
-            torch.linspace(
-                start_batch_idx,
-                start_batch_idx + total_batch_iters - 1,
-                validate_amount,
-            )
-            .long()
-            .tolist()
+            torch.linspace(1, total_batch_iters, validate_amount).long().tolist()
         )
 
         return log_train_loss_idxs, run_valid_interval_idxs
 
+    def _confirm_checkpoint_safe_point(self, cum_batch: int) -> None:
+        """
+        Confirm over the process group that every rank reached the same
+        checkpoint-safe point: the same cumulative micro-batch count, on an
+        accumulation boundary and with no pending gradient. A checkpoint may
+        only be written once all ranks agree.
+        """
+        accumulation = self.config.train.gradient_accumulate_every
+        with required_stage(STAGE_CHECKPOINT_SAVE, world_size=self._world_size) as report:
+            report.state = str(cum_batch)
+            if cum_batch % accumulation != 0:
+                raise ValueError(
+                    f"cumulative micro-batch {cum_batch} is not an accumulation boundary "
+                    f"(gradient_accumulate_every={accumulation})"
+                )
+            if not self._gradients_are_cleared():
+                raise ValueError(f"cumulative micro-batch {cum_batch} has pending gradients")
+
+    def _gradients_are_cleared(self) -> bool:
+        return all(parameter.grad is None for parameter in self._model_dist.parameters())
+
     def _save_latest_checkpoint(
         self,
         *,
-        optimizer: Optimizer,
-        scheduler: LRScheduler,
-        grad_scaler: torch.GradScaler,
         loss: float,
         next_batch_idx: int,
         next_epoch: int,
-        next_cumulative_batch_idx: int,
+        cum_batch: int,
     ) -> None:
         if not self.config.train.latest_checkpoint_enabled:
             return
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-        if not self._is_main_worker:
+        self._confirm_checkpoint_safe_point(cum_batch)
+        if not self._is_main_writer:
             return
 
         original_model = self._unpack_distributed_model(self._model_dist)
         save_training_checkpoint_state(
-            self._output_dir,
+            self.output_dir,
             self.config.train.latest_checkpoint_name,
             model=original_model,
             loss=loss,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            grad_scaler=grad_scaler,
+            optimizer=self._optimizer,
+            scheduler=self._scheduler,
+            grad_scaler=self._grad_scaler,
             epoch=next_epoch,
             batch=next_batch_idx,
-            cum_batch=next_cumulative_batch_idx,
+            cum_batch=cum_batch,
         )
 
         self._log.debug(
@@ -544,13 +656,10 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     def _maybe_save_latest_checkpoint(
         self,
         *,
-        optimizer: Optimizer,
-        scheduler: LRScheduler,
-        grad_scaler: torch.GradScaler,
         loss: float,
         next_batch_idx: int,
         next_epoch: int,
-        next_cumulative_batch_idx: int,
+        cum_batch: int,
         completed_optimizer_steps: int,
     ) -> None:
         if not self.config.train.latest_checkpoint_enabled:
@@ -568,19 +677,16 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             return
 
         self._save_latest_checkpoint(
-            optimizer=optimizer,
-            scheduler=scheduler,
-            grad_scaler=grad_scaler,
             loss=loss,
             next_batch_idx=next_batch_idx,
             next_epoch=next_epoch,
-            next_cumulative_batch_idx=next_cumulative_batch_idx,
+            cum_batch=cum_batch,
         )
         self._last_latest_checkpoint_step = completed_optimizer_steps
         self._last_latest_checkpoint_time = now
 
     def _save_training_state(self, batch_i: int, epoch: int):
-        if not self._is_main_worker:
+        if not self._is_main_writer:
             return
         num_written, num_overwritten, _ = self._save_best_models()
         self._log.debug(
@@ -797,7 +903,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         # batch (due to batch sizes and sequence lengths). in order to reach the
         # lower bound, the actual number of elements trained per worker may be
         # slightly higher.
-        local_batch_iters = math.ceil(local_target_elements / elements_per_batch)
+        local_batch_iters = self.local_batch_iters()
         expected_local_elements = elements_per_batch * local_batch_iters
         expected_global_elements = expected_local_elements * self._world_size
         delta = expected_global_elements - global_target_elements
@@ -817,79 +923,46 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self._log.debug(f"Target element delta (global): {delta} elements")
         self._log.info(f"Running {local_batch_iters} batch iterations")
 
-        optimizer = self.configure_optimizer(self._model_dist.parameters())
-
-        local_gradient_steps = local_batch_iters // train_conf.gradient_accumulate_every
-        scheduler = self.configure_scheduler(optimizer, local_gradient_steps)
-
         epoch: int = 0
         epoch_batch_idx: int = 0
+        # the cursor counts the micro-batches this rank has completed, and is the
+        # coordinate the run logs, validates and saves at. it is read from the
+        # checkpoint and never recomputed from a loader length.
+        cum_batch: int = 0
         if self._resume_cursor is not None:
             self._log.debug("Resuming training, offsetting start epoch and batch index")
             epoch = self._resume_cursor.epoch
             epoch_batch_idx = self._resume_cursor.batch
+            cum_batch = self._resume_cursor.cum_batch
             train_dataset.offset_to(epoch)
         else:
             self._log.info("Starting training from scratch")
         self._log.debug(f"Starting from epoch {epoch}")
         self._log.debug(f"Starting from batch {epoch_batch_idx}")
+        self._log.debug(f"Starting from cumulative micro-batch {cum_batch}")
         self._log_cuda_memory_snapshot(None)
 
-        cumulative_batch_idx_start = len(train_loader) * epoch + epoch_batch_idx
-        if cumulative_batch_idx_start > local_batch_iters:
+        start_cum_batch = cum_batch
+        if start_cum_batch > local_batch_iters:
             self._log.warning(
-                f"Resume position {cumulative_batch_idx_start} exceeds target "
+                f"Resume position {start_cum_batch} exceeds target "
                 f"iterations {local_batch_iters}; no further training will run"
             )
-        remaining_batch_iters = max(local_batch_iters - cumulative_batch_idx_start, 0)
+        remaining_batch_iters = max(local_batch_iters - start_cum_batch, 0)
         self._log.info(f"Remaining batch iterations: {remaining_batch_iters}")
-        global_log_train_idxs, global_run_valid_idxs = self._calc_logging_points(
-            local_batch_iters,
-            start_batch_idx=0,
-        )
-        global_log_train_idxs = {
-            idx for idx in global_log_train_idxs if idx >= cumulative_batch_idx_start
-        }
-        global_run_valid_idxs = {
-            idx for idx in global_run_valid_idxs if idx >= cumulative_batch_idx_start
-        }
+        log_train_idxs, run_valid_idxs = self._calc_logging_points(local_batch_iters)
+        log_train_idxs = {idx for idx in log_train_idxs if idx > start_cum_batch}
+        run_valid_idxs = {idx for idx in run_valid_idxs if idx > start_cum_batch}
 
         def before_new_epoch(epoch: int) -> None:
             self._log.info(f"Initializing epoch {epoch}")
             train_dataset.offset_to(epoch)
 
-        gradient_scaler = torch.GradScaler(device=self._device_type)
-        if self.config.resume and self._resume_training_snapshot:
-            has_training_state = any(
-                self._resume_training_snapshot.get(key) is not None
-                for key in ("OPTIMIZER", "SCHEDULER", "GRAD_SCALER")
-            )
-            restore_training_component_states(
-                self._resume_training_snapshot,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                grad_scaler=gradient_scaler,
-                optimizer_device=self._device,
-            )
-            if has_training_state:
-                self._log.info(
-                    "Restored optimizer/scheduler/scaler from checkpoint: "
-                    f"{self.config.resume.checkpoint_file}"
-                )
-            else:
-                self._log.warning(
-                    "Resume checkpoint has no optimizer/scheduler/scaler state; "
-                    "resuming model weights only."
-                )
-            self._resume_training_snapshot = None
-
         # total elements seen during trainings
-        elements_seen_total = elements_per_batch * cumulative_batch_idx_start
+        elements_seen_total = elements_per_batch * start_cum_batch
         curr_avg_grad: float = -1
         curr_avg_grad_clipped: float = -1
-        completed_optimizer_steps = (
-            cumulative_batch_idx_start // train_conf.gradient_accumulate_every
-        )
+        completed_optimizer_steps = start_cum_batch // train_conf.gradient_accumulate_every
         self._last_latest_checkpoint_step = completed_optimizer_steps
         self._last_latest_checkpoint_time = time()
         last_successful_optimizer_step: tuple[int, int, int, float] | None = None
@@ -911,13 +984,6 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
             epoch, epoch_batch_idx, batch = iteration.epoch, iteration.batch, iteration.item
             next_epoch, next_batch_idx = iteration.next_epoch, iteration.next_batch
-
-            # keep track of the cumulative batch index across epochs for
-            # logging. this is used for the log points (when to log train loss
-            # and run validation). the value is also used to log the global
-            # batch index for convenient post-processing of the logs
-            cumulative_batch_idx = len(train_loader) * epoch + epoch_batch_idx
-            log_prefix = f"{[cumulative_batch_idx]}"
 
             self._model_dist.train()
 
@@ -948,11 +1014,16 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                 train_loss = train_loss / train_conf.gradient_accumulate_every
             elements_seen_total += elements_per_batch
 
-            scaled_loss = gradient_scaler.scale(train_loss)
+            scaled_loss = self._grad_scaler.scale(train_loss)
 
             start_bw_measure = time()
             scaled_loss.backward()
             bw_exec_time = time() - start_bw_measure
+
+            # this micro-batch is complete: the cursor moves before anything
+            # reads it, so every point below is decided on a completed count
+            cum_batch += 1
+            log_prefix = f"{[cum_batch]}"
 
             # if enabled, report forward/backward pass execution times for the
             # first track_first_fw_bw_exec_times iterations as well as cuda
@@ -965,7 +1036,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             if self.options.track_first_fw_bw_exec_times:
                 self.options.track_first_fw_bw_exec_times -= 1
                 self._write_csv_timemem(
-                    cum_batch=cumulative_batch_idx,
+                    cum_batch=cum_batch,
                     kind=ModelMode.TRAIN,
                     fw_time=fw_exec_time,
                     bw_time=bw_exec_time,
@@ -973,25 +1044,25 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                     num_items=self.config.train.batch_size,
                 )
 
-            if cumulative_batch_idx in global_log_train_idxs:
+            if cum_batch in log_train_idxs:
                 self._log.info(f"{log_prefix} Training loss: {train_loss_as_flt}")
                 self._write_csv_loss(
                     ModelMode.TRAIN,
                     loss=train_loss_as_flt,
                     epoch=epoch,
                     batch=epoch_batch_idx,
-                    cum_batch=cumulative_batch_idx,
+                    cum_batch=cum_batch,
                     elements_seen=elements_seen_total,
-                    lr=scheduler.get_last_lr()[0],
+                    lr=self._scheduler.get_last_lr()[0],
                     avg_grad=curr_avg_grad,
                     avg_grad_clipped=curr_avg_grad_clipped,
                 )
 
             # accumulate the gradient with clipping:
             # https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
-            if (epoch_batch_idx + 1) % train_conf.gradient_accumulate_every == 0:
+            if cum_batch % train_conf.gradient_accumulate_every == 0:
                 # restore the scaled gradient for clipping
-                gradient_scaler.unscale_(optimizer)
+                self._grad_scaler.unscale_(self._optimizer)
 
                 curr_avg_grad = self.avg_gradient_value()
 
@@ -1003,32 +1074,29 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
                 curr_avg_grad_clipped = self.avg_gradient_value()
 
-                gradient_scaler.step(optimizer)
-                scale = gradient_scaler.get_scale()
-                gradient_scaler.update()
+                self._grad_scaler.step(self._optimizer)
+                scale = self._grad_scaler.get_scale()
+                self._grad_scaler.update()
 
                 # https://discuss.pytorch.org/t/optimizer-step-before-lr-scheduler-step-error-using-gradscaler/92930/7
-                skip_lr_sched = scale > gradient_scaler.get_scale()
-                if scheduler and not skip_lr_sched:
-                    scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                skip_lr_sched = scale > self._grad_scaler.get_scale()
+                if self._scheduler and not skip_lr_sched:
+                    self._scheduler.step()
+                self._optimizer.zero_grad(set_to_none=True)
                 if not skip_lr_sched:
                     completed_optimizer_steps += 1
-                    next_cumulative_batch_idx = len(train_loader) * next_epoch + next_batch_idx
+                    # the cursor already points at the next micro-batch to run
                     last_successful_optimizer_step = (
                         next_epoch,
                         next_batch_idx,
-                        next_cumulative_batch_idx,
+                        cum_batch,
                         train_loss_as_flt,
                     )
                     self._maybe_save_latest_checkpoint(
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        grad_scaler=gradient_scaler,
                         loss=train_loss_as_flt,
                         next_batch_idx=next_batch_idx,
                         next_epoch=next_epoch,
-                        next_cumulative_batch_idx=next_cumulative_batch_idx,
+                        cum_batch=cum_batch,
                         completed_optimizer_steps=completed_optimizer_steps,
                     )
 
@@ -1039,12 +1107,12 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             # are still being accumulated, and thus have the model has not
             # learned from the elements yet. on a large scale, this hardly
             # matters
-            if not self.options.skip_validation and cumulative_batch_idx in global_run_valid_idxs:
+            if not self.options.skip_validation and cum_batch in run_valid_idxs:
                 valid_loss = self._evaluate(
                     self._model_dist,
                     valid_loader,
                     items_seen_so_far=elements_seen_total,
-                    cumulative_batch_idx=cumulative_batch_idx,
+                    cumulative_batch_idx=cum_batch,
                 )
                 self._log.info(f"{log_prefix} Validation loss: {valid_loss}")
                 self._write_csv_loss(
@@ -1052,7 +1120,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
                     loss=valid_loss,
                     epoch=epoch,
                     batch=epoch_batch_idx,
-                    cum_batch=cumulative_batch_idx,
+                    cum_batch=cum_batch,
                     elements_seen=elements_seen_total,
                     lr=-1,
                     avg_grad=-1,
@@ -1076,13 +1144,13 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             # we have seen exactly local_batch_iters batches
             elements_match = (
                 elements_seen_total == expected_local_elements
-                or cumulative_batch_idx_start >= local_batch_iters
+                or start_cum_batch >= local_batch_iters
             )
             if not elements_match:
                 self._log.fatal(
                     f"Mismatch between expected and actual elements seen: {expected_local_elements}, {elements_seen_total}"
                 )
-            if completed_optimizer_steps == 0 and cumulative_batch_idx_start < local_batch_iters:
+            if completed_optimizer_steps == 0 and start_cum_batch < local_batch_iters:
                 # a run that ends without a single optimizer step has trained
                 # nothing; only a resume cursor that already reached the target
                 # is a legitimate zero-step run
@@ -1099,25 +1167,20 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             self._log.info("Finished training")
             self._log.info(f"Stats (local): Elements seen: {elements_seen_total}")
             if last_successful_optimizer_step:
-                next_epoch, next_batch_idx, next_cumulative_batch_idx, loss = (
-                    last_successful_optimizer_step
-                )
+                next_epoch, next_batch_idx, save_cum_batch, loss = last_successful_optimizer_step
                 self._save_latest_checkpoint(
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    grad_scaler=gradient_scaler,
                     loss=loss,
                     next_batch_idx=next_batch_idx,
                     next_epoch=next_epoch,
-                    next_cumulative_batch_idx=next_cumulative_batch_idx,
+                    cum_batch=save_cum_batch,
                 )
 
         best_model = self._unpack_distributed_model(self._model_dist)
 
-        if self._is_main_worker and self.config.io.num_models_to_save > 0:
-            # if, on the main worker, populate the model with the best state
-            # non-main workers will simply return the latest model, which won't
-            # be used anyway because testing happens only on the main worker
+        if self._is_main_writer and self.config.io.num_models_to_save > 0:
+            # the writer returns the model candidate it holds; the other ranks
+            # return their latest model, which only becomes the tested one once
+            # the chosen state is distributed to them
             ((least_loss, best_state),) = self._top_n_models.get_top(1)
             best_model.load_state_dict(best_state)
             self._log.info(f"Returning model with least loss ({least_loss})")
@@ -1131,10 +1194,11 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         test_dataset: DistributedDataset[TBatch],
         model: torch.nn.Module,
     ) -> None:
-        # test only on main worker
-        if not self._is_main_worker:
-            return
-
+        """
+        Evaluate a model on the test set. Every rank takes part: the model has
+        been distributed beforehand, and the writers among the ranks record the
+        result.
+        """
         # instantiate test data loader, currently
         # no additional arguments forwarded to instantiation.
         test_loader = self.get_test_dataloader(test_dataset)

@@ -149,6 +149,8 @@ class CoreIoConfig(BaseModel):
     `CoreTrainer`.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     name_model: str = Field(description="Model name for saving checkpoints")
     output_dir: str = Field(
         description="The output directory for all artefacts (will be created automatically based on `model_name` and a unique postfix)"
@@ -160,9 +162,6 @@ class CoreIoConfig(BaseModel):
         description="How often (in total) to run the validation set and reserve a model candidate. **Must be >= than `num_models_to_save`**"
     )
     log_train_loss_amount: int = Field(description="How often (in total) to log training loss")
-    enabled_loss_log_for_gpus: list[int] = Field(
-        default=[0], description="The rank of the GPUs that should write to the CSV loss file"
-    )
 
 
 TModelParams = TypeVar("TModelParams", covariant=True, bound=CoreModelParams)

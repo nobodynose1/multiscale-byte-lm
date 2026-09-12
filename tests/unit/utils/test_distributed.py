@@ -18,10 +18,13 @@ class TestProcessGroupTimeout:
     ):
         init_process_group = mocker.patch.object(distributed_module, "init_process_group")
         mocker.patch.object(distributed_module, "destroy_process_group")
+        mocker.patch.object(distributed_module, "get_rank", lambda: 0)
         fake_torchrun_environment(monkeypatch)
 
         with process_group(backend="gloo", timeout=timedelta(seconds=600)) as run_vars:
-            assert run_vars == ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+            assert run_vars == ElasticRunVars(
+                local_rank=0, global_rank=0, world_size=1, is_cuda=False
+            )
 
         init_process_group.assert_called_once_with(backend="gloo", timeout=timedelta(seconds=600))
 
@@ -30,6 +33,7 @@ class TestProcessGroupTimeout:
     ):
         init_process_group = mocker.patch.object(distributed_module, "init_process_group")
         mocker.patch.object(distributed_module, "destroy_process_group")
+        mocker.patch.object(distributed_module, "get_rank", lambda: 0)
         fake_torchrun_environment(monkeypatch)
 
         with process_group(backend="gloo"):

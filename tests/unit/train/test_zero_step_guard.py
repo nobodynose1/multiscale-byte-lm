@@ -19,8 +19,10 @@ from mblm.train.core.config import (
     GenericEntryConfig,
     ResumeConfig,
 )
+from mblm.train.core.startup import start_trainer
 from mblm.train.core.trainer import CoreTrainer, CoreTrainerOptions
 from mblm.utils.distributed import ElasticRunVars
+from mblm.utils.io import CheckpointCursor
 
 
 class RecordingLogger:
@@ -83,26 +85,28 @@ class FakeDataset:
 
 
 class FakeLoader:
-    def __init__(self, batches: int) -> None:
+    def __init__(self, batches: int, value: float = 0.0) -> None:
         self._batches = batches
+        self._value = value
 
     def __len__(self) -> int:
         return self._batches
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        return iter([torch.zeros(1) for _ in range(self._batches)])
+        return iter([torch.full((1,), self._value) for _ in range(self._batches)])
 
 
 def entry_config(
     tmp_path: Path,
     *,
     gradient_accumulate_every: int,
+    target_elements: int = 1,
     resume: ResumeConfig | None = None,
 ) -> TinyEntryConfig:
     return TinyEntryConfig(
         params=TinyParams(input_seq_len=1),
         train=CoreTrainConfig(
-            target_elements=1,
+            target_elements=target_elements,
             target_elements_strategy="batch",
             batch_size=1,
             learning_rate=0.1,
@@ -122,11 +126,18 @@ def entry_config(
 class TrainerHarness:
     """Run the real `_train` loop over a tiny in-memory model."""
 
-    def __init__(self, mocker: MockerFixture, tmp_path: Path, config: TinyEntryConfig) -> None:
+    def __init__(
+        self,
+        mocker: MockerFixture,
+        tmp_path: Path,
+        config: TinyEntryConfig,
+        *,
+        batch_value: float = 0.0,
+    ) -> None:
         self.log = RecordingLogger()
         self.trainer = self._build(mocker, tmp_path, config)
         self.dataset = FakeDataset()
-        loader = FakeLoader(batches=1)
+        loader = FakeLoader(batches=1, value=batch_value)
         mocker.patch.object(
             TinyTrainer, "get_train_dataloader", lambda _self, _dataset, **_kwargs: loader
         )
@@ -136,14 +147,14 @@ class TrainerHarness:
 
     def _build(self, mocker: MockerFixture, tmp_path: Path, config: TinyEntryConfig) -> TinyTrainer:
         log = self.log
-        mocker.patch.object(TinyTrainer, "_create_output_dir", lambda _self, _io: tmp_path)
+        mocker.patch.object(TinyTrainer, "create_output_dir", lambda _self: str(tmp_path))
         mocker.patch.object(TinyTrainer, "configure_logger", lambda _self, *_args, **_kwargs: log)
         mocker.patch.object(TinyTrainer, "_init_distributed_model", lambda _self, model: model)
         mocker.patch.object(TinyTrainer, "_dump_output_config")
 
         trainer = TinyTrainer(
             config,
-            run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False),
+            run_vars=ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False),
             options=CoreTrainerOptions(
                 display_progress=False,
                 track_first_fw_bw_exec_times=None,
@@ -151,6 +162,7 @@ class TrainerHarness:
                 amp_dtype=torch.bfloat16,
             ),
         )
+        start_trainer(trainer, world_size=1)
         return trainer
 
     def train(self) -> TinyModel:
@@ -162,9 +174,13 @@ class TestZeroStepGuard:
     def test_a_fresh_run_without_a_single_optimizer_step_fails(
         self, mocker: MockerFixture, tmp_path: Path
     ):
-        # one batch iteration, accumulated over two: the optimizer is never stepped
+        # an infinite loss makes the gradient scaler skip the only optimizer
+        # step of the run, so the run ends having trained nothing
         harness = TrainerHarness(
-            mocker, tmp_path, entry_config(tmp_path, gradient_accumulate_every=2)
+            mocker,
+            tmp_path,
+            entry_config(tmp_path, gradient_accumulate_every=1),
+            batch_value=float("inf"),
         )
 
         with pytest.raises(RuntimeError, match="without a single optimizer step"):
@@ -172,7 +188,7 @@ class TestZeroStepGuard:
 
         assert harness.log.fatals == [
             "Finished training without a single optimizer step: "
-            "1 batch iterations, gradient accumulation of 2"
+            "1 batch iterations, gradient accumulation of 1"
         ]
 
     def test_a_resume_that_already_reached_the_target_may_finish_without_steps(
@@ -181,20 +197,20 @@ class TestZeroStepGuard:
         mocker.patch.object(
             trainer_module,
             "load_training_checkpoint_state",
-            lambda _path, model, **_kwargs: (
-                model,
+            lambda _path, _model, **_kwargs: (
+                CheckpointCursor(epoch=1, batch=0, cum_batch=2),
                 12.5,
-                {"EPOCH": 1, "BATCH": 0, "CUM_BATCH": 1},
             ),
         )
-        # the checkpoint cursor sits at epoch 1 of a loader holding a single
-        # batch: the target is already reached, nothing is left to train
+        # the checkpoint cursor already stands at the run's micro-batch target:
+        # nothing is left to train
         harness = TrainerHarness(
             mocker,
             tmp_path,
             entry_config(
                 tmp_path,
                 gradient_accumulate_every=2,
+                target_elements=2,
                 resume=ResumeConfig(checkpoint_file="unused.pth"),
             ),
         )

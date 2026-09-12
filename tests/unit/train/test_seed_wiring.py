@@ -128,7 +128,7 @@ def run_entry(
     @contextmanager
     def fake_process_group(**kwargs: Any) -> Iterator[ElasticRunVars]:
         process_group_kwargs.update(kwargs)
-        yield ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+        yield ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False)
 
     def fake_admission(_params: Any, **_kwargs: Any) -> MambaAdmissionState:
         calls.append("admission")
@@ -140,6 +140,9 @@ def run_entry(
 
     def fake_marker(*_args: Any, **_kwargs: Any) -> None:
         calls.append("marker")
+
+    def fake_start_trainer(*_args: Any, **_kwargs: Any) -> None:
+        calls.append("startup")
 
     class TrainerStub:
         def __init__(self, _config: Any, **_kwargs: Any):
@@ -162,6 +165,8 @@ def run_entry(
     mocker.patch.object(
         train_module, "create_logger", lambda *_args, **_kwargs: RecordingLogger(messages)
     )
+    mocker.patch.object(train_module, "bootstrap_log", lambda: RecordingLogger(messages))
+    mocker.patch.object(train_module, "start_trainer", fake_start_trainer)
     mocker.patch.object(train_module, "process_group", fake_process_group)
     mocker.patch.object(train_module, "run_mamba_admission", fake_admission)
     mocker.patch.object(train_module, "seed_run", fake_seed_run)
@@ -191,6 +196,7 @@ class TestSeedWiring:
             "dataset:train",
             "dataset:valid",
             "trainer",
+            "startup",
             "marker",
             "train",
         ]
@@ -207,6 +213,7 @@ class TestSeedWiring:
             "dataset:train",
             "dataset:valid",
             "trainer",
+            "startup",
             "marker",
             "train",
         ]
@@ -221,6 +228,7 @@ class TestSeedWiring:
             "dataset:train",
             "dataset:valid",
             "trainer",
+            "startup",
             "marker",
             "train",
         ]

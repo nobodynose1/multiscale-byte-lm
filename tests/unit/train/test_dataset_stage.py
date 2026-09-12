@@ -119,7 +119,7 @@ def masked_entry_config() -> TrainMaskedEntryConfig:
 def process_group_stub(world_size: int):
     @contextmanager
     def process_group(**_kwargs: Any) -> Iterator[ElasticRunVars]:
-        yield ElasticRunVars(local_rank=0, world_size=world_size, is_cuda=False)
+        yield ElasticRunVars(local_rank=0, global_rank=0, world_size=world_size, is_cuda=False)
 
     return process_group
 
@@ -181,7 +181,12 @@ class EntryHarness:
             def supports_test_mode() -> bool:
                 return False
 
+        def fake_start_trainer(*_args: Any, **_kwargs: Any) -> None:
+            calls.append("startup")
+
         mocker.patch.object(train_module, "create_logger", lambda *_args, **_kwargs: self.entry_log)
+        mocker.patch.object(train_module, "bootstrap_log", lambda: self.bootstrap_log)
+        mocker.patch.object(train_module, "start_trainer", fake_start_trainer)
         mocker.patch.object(startup_module, "_log", self.bootstrap_log)
         mocker.patch.object(train_module, "process_group", process_group_stub(self._world_size))
         mocker.patch.object(train_module, "run_mamba_admission", fake_admission)
@@ -214,6 +219,7 @@ class TestDatasetStage:
             "dataset:train",
             "dataset:valid",
             "trainer",
+            "startup",
             "marker",
             "train",
         ]

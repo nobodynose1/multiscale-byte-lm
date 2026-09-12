@@ -63,7 +63,7 @@ def model_params(block: Any) -> MBLMModelConfig:
 
 
 def single_process() -> ElasticRunVars:
-    return ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+    return ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False)
 
 
 def test_backends_are_not_imported_when_the_configuration_is_imported():

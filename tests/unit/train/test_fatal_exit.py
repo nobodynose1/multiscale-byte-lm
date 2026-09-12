@@ -115,7 +115,7 @@ def masked_entry_config() -> TrainMaskedEntryConfig:
 
 @contextmanager
 def process_group_stub(**_kwargs: Any) -> Iterator[ElasticRunVars]:
-    yield ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+    yield ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False)
 
 
 class DatasetStub:
@@ -148,6 +148,8 @@ class TestFatalTrainingErrorExitsNonZero:
         shutdown = mocker.patch.object(train_module, "shutdown_log_handlers")
 
         mocker.patch.object(train_module, "create_logger", lambda *_args, **_kwargs: entry_log)
+        mocker.patch.object(train_module, "bootstrap_log", lambda: entry_log)
+        mocker.patch.object(train_module, "start_trainer", lambda *_args, **_kwargs: None)
         mocker.patch.object(train_module, "process_group", process_group_stub)
         mocker.patch.object(
             train_module,

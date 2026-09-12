@@ -63,7 +63,8 @@ class TestConfigToModel:
             return None
 
         run_mamba_admission(
-            config.params, run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False)
+            config.params,
+            run_vars=ElasticRunVars(local_rank=0, global_rank=0, world_size=1, is_cuda=False),
         )
         _ = MBLM(model_config)
 

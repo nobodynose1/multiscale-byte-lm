@@ -27,11 +27,19 @@ from typing import Literal
 
 import torch
 from pydantic import BaseModel
-from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed import destroy_process_group, get_rank, init_process_group
 
 
 class ElasticRunVars(BaseModel):
+    """
+    The ranks this process runs under. `global_rank` identifies the process
+    across the whole run and is the only rank that owns shared artefacts;
+    `local_rank` identifies it within its own node and is used for device
+    selection and data sharding only.
+    """
+
     local_rank: int
+    global_rank: int
     world_size: int
     is_cuda: bool
 
@@ -44,7 +52,12 @@ def _torchrun_env_variables(is_cuda: bool) -> ElasticRunVars:
     local_rank = os.environ.get("LOCAL_RANK")
     world_size = os.environ.get("WORLD_SIZE")
     assert local_rank and world_size
-    return ElasticRunVars(local_rank=int(local_rank), world_size=int(world_size), is_cuda=is_cuda)
+    return ElasticRunVars(
+        local_rank=int(local_rank),
+        global_rank=get_rank(),
+        world_size=int(world_size),
+        is_cuda=is_cuda,
+    )
 
 
 @contextmanager

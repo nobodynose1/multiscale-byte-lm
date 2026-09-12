@@ -102,6 +102,56 @@ def test_ranks_that_disagree_on_the_stage_fail_together(monkeypatch: pytest.Monk
     assert decision.reason is not None and "datasets" in decision.reason
 
 
+def test_ranks_that_disagree_on_the_stage_state_fail_together(monkeypatch: pytest.MonkeyPatch):
+    local = StageOutcome(stage="checkpoint", ok=True, state="fresh")
+    monkeypatch.setattr(
+        startup_module.dist,
+        "all_gather_object",
+        fake_gather(local, StageOutcome(stage="checkpoint", ok=True, state="resume")),
+    )
+    monkeypatch.setattr(startup_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(startup_module.dist, "broadcast_object_list", noop)
+
+    decision = unify_stage_outcome(local, world_size=2)
+
+    assert not decision.ok
+    assert decision.reason is not None
+    assert "fresh" in decision.reason and "resume" in decision.reason
+
+
+def test_a_stage_value_written_by_two_ranks_fails_the_stage(monkeypatch: pytest.MonkeyPatch):
+    local = StageOutcome(stage="output_dir", ok=True, value="/runs/a")
+    monkeypatch.setattr(
+        startup_module.dist,
+        "all_gather_object",
+        fake_gather(local, StageOutcome(stage="output_dir", ok=True, value="/runs/b")),
+    )
+    monkeypatch.setattr(startup_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(startup_module.dist, "broadcast_object_list", noop)
+
+    decision = unify_stage_outcome(local, world_size=2)
+
+    assert not decision.ok
+    assert decision.reason is not None
+    assert "more than one rank" in decision.reason
+
+
+def test_the_value_of_one_rank_reaches_every_other_rank(monkeypatch: pytest.MonkeyPatch):
+    local = StageOutcome(stage="output_dir", ok=True)
+    monkeypatch.setattr(
+        startup_module.dist,
+        "all_gather_object",
+        fake_gather(StageOutcome(stage="output_dir", ok=True, value="/runs/a"), local),
+    )
+    monkeypatch.setattr(startup_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(startup_module.dist, "broadcast_object_list", noop)
+
+    decision = unify_stage_outcome(local, world_size=2)
+
+    assert decision.ok
+    assert decision.value == "/runs/a"
+
+
 def test_a_failure_on_this_rank_is_reported_on_stderr_and_exits(monkeypatch: pytest.MonkeyPatch):
     log = RecordingLogger()
     monkeypatch.setattr(startup_module, "_log", log)

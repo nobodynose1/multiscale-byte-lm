@@ -44,7 +44,9 @@ def test_from_config():
     # the entry point admits the declared engine before building a model
     run_mamba_admission(
         config,
-        run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False),
+        run_vars=ElasticRunVars(
+            local_rank=0, global_rank=0, world_size=1, is_cuda=False
+        ),
     )
     mblm = MBLM(config)
 
@@ -94,7 +96,9 @@ def test_from_yaml():
     model_config = MBLMModelConfig.model_validate(parsed_config)
     run_mamba_admission(
         model_config,
-        run_vars=ElasticRunVars(local_rank=0, world_size=1, is_cuda=False),
+        run_vars=ElasticRunVars(
+            local_rank=0, global_rank=0, world_size=1, is_cuda=False
+        ),
     )
     mblm = MBLM(model_config)
     x = torch.randint(0, 258, (1, 12)).long()

@@ -49,7 +49,14 @@ from mblm.train.core.config import (
     GenericOutputConfig,
     TrainMaskedConfig,
 )
-from mblm.train.core.startup import required_stage
+from mblm.train.core.startup import (
+    STAGE_DATASETS,
+    STAGE_TEST_DATASETS,
+    STAGE_TEST_MODEL,
+    bootstrap_log,
+    required_stage,
+    start_trainer,
+)
 from mblm.train.core.trainer import CoreTrainer
 from mblm.utils.distributed import process_group
 from mblm.utils.logging import create_logger, shutdown_log_handlers
@@ -277,7 +284,11 @@ class MegabyteTrainer(
         )
 
     def configure_run_id(self) -> str:
-        return os.getenv("JOB_ID") or super().configure_run_id()
+        # the scheduler's job id is at most a readable prefix: the unique part of
+        # a run id is never taken from the environment
+        job_id = os.getenv("JOB_ID")
+        run_id = super().configure_run_id()
+        return f"{job_id}_{run_id}" if job_id else run_id
 
     def configure_count_parameters(self, model):
         return count_params(model)
@@ -290,20 +301,19 @@ masked_dataset_registry.register("pg19masked")(PG19Masked)
 dataset_registry.register("pg19")(PG19)
 dataset_registry.register("clevr")(Clevr)
 
-_DATASET_STAGE = "datasets"
-
 
 def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
-    log = create_logger(__name__, log_dir=config.io.output_dir)
+    # until the run owns an output directory, every rank reports to stderr only
+    log = bootstrap_log()
     try:
         timeout_seconds = config.train.distributed_timeout_seconds
         log.info(f"Distributed timeout: {timeout_seconds} seconds")
         with process_group(backend="gloo", timeout=timedelta(seconds=timeout_seconds)) as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
-            effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
+            effective_seed = seed_run(config.train.seed, rank=run_vars.global_rank)
             if effective_seed is not None:
                 log.info(f"Effective seed: {effective_seed}")
-            with required_stage(_DATASET_STAGE, world_size=run_vars.world_size):
+            with required_stage(STAGE_DATASETS, world_size=run_vars.world_size):
                 dataset = masked_dataset_registry.retrieve(config.io.dataset_id)
                 train_dataset = dataset.from_train_entry_config(
                     config=config,
@@ -318,14 +328,19 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
                     num_workers=1,
                 )
             trainer = MaskedTrainer(config, run_vars=run_vars)
-            if torch.distributed.get_rank() == 0:
+            start_trainer(trainer, world_size=run_vars.world_size)
+            if run_vars.global_rank == 0:
                 write_mamba_impl_marker(trainer.output_dir, admission)
+            log = create_logger(__name__, log_dir=trainer.output_dir)
             best_model = trainer.train(train_dataset, eval_dataset)
             if best_model and dataset.supports_test_mode():
-                test_dataset = dataset.from_train_entry_config(
-                    config, mode=ModelMode.TEST, worker_id=0, num_workers=1
-                )
-                trainer.test(test_dataset=test_dataset, model=best_model)
+                with required_stage(STAGE_TEST_DATASETS, world_size=run_vars.world_size):
+                    test_dataset = dataset.from_train_entry_config(
+                        config, mode=ModelMode.TEST, worker_id=0, num_workers=1
+                    )
+                with required_stage(STAGE_TEST_MODEL, world_size=run_vars.world_size):
+                    test_model = trainer.share_test_model(best_model)
+                trainer.test(test_dataset=test_dataset, model=test_model)
 
     except Exception as error:
         log.fatal(error, exc_info=True)
@@ -334,17 +349,18 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
 
 
 def train_mblm(config: TrainEntryConfig) -> None:
-    log = create_logger(__name__, log_dir=config.io.output_dir)
+    # until the run owns an output directory, every rank reports to stderr only
+    log = bootstrap_log()
 
     try:
         timeout_seconds = config.train.distributed_timeout_seconds
         log.info(f"Distributed timeout: {timeout_seconds} seconds")
         with process_group(backend="nccl", timeout=timedelta(seconds=timeout_seconds)) as run_vars:
             admission = run_mamba_admission(config.params, run_vars=run_vars)
-            effective_seed = seed_run(config.train.seed, rank=torch.distributed.get_rank())
+            effective_seed = seed_run(config.train.seed, rank=run_vars.global_rank)
             if effective_seed is not None:
                 log.info(f"Effective seed: {effective_seed}")
-            with required_stage(_DATASET_STAGE, world_size=run_vars.world_size):
+            with required_stage(STAGE_DATASETS, world_size=run_vars.world_size):
                 dataset = dataset_registry.retrieve(config.io.dataset_id)
 
                 train_dataset = dataset.from_train_entry_config(
@@ -361,19 +377,24 @@ def train_mblm(config: TrainEntryConfig) -> None:
                 )
 
             trainer = MegabyteTrainer(config, run_vars=run_vars)
-            if torch.distributed.get_rank() == 0:
+            start_trainer(trainer, world_size=run_vars.world_size)
+            if run_vars.global_rank == 0:
                 write_mamba_impl_marker(trainer.output_dir, admission)
+            log = create_logger(__name__, log_dir=trainer.output_dir)
             best_model = trainer.train(train_dataset, valid_dataset)
 
             supports_test_mode = dataset.supports_test_mode()
             if best_model and supports_test_mode:
-                test_dataset = dataset.from_train_entry_config(
-                    config,
-                    mode=ModelMode.TEST,
-                    worker_id=0,
-                    num_workers=1,
-                )
-                trainer.test(test_dataset, best_model)
+                with required_stage(STAGE_TEST_DATASETS, world_size=run_vars.world_size):
+                    test_dataset = dataset.from_train_entry_config(
+                        config,
+                        mode=ModelMode.TEST,
+                        worker_id=0,
+                        num_workers=1,
+                    )
+                with required_stage(STAGE_TEST_MODEL, world_size=run_vars.world_size):
+                    test_model = trainer.share_test_model(best_model)
+                trainer.test(test_dataset, test_model)
     except Exception as error:
         log.fatal(error, exc_info=True)
         shutdown_log_handlers()
@@ -423,7 +444,11 @@ class MaskedTrainer(
         )
 
     def configure_run_id(self) -> str:
-        return os.getenv("JOB_ID") or super().configure_run_id()
+        # the scheduler's job id is at most a readable prefix: the unique part of
+        # a run id is never taken from the environment
+        job_id = os.getenv("JOB_ID")
+        run_id = super().configure_run_id()
+        return f"{job_id}_{run_id}" if job_id else run_id
 
     def configure_count_parameters(self, model):
         return count_params(model)

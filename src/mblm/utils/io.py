@@ -79,9 +79,19 @@ def load_yml(
 
 
 def dump_yml(path: str | Path, data: BaseModel) -> Path:
+    """
+    Atomically dump a model to a yaml file by writing a sibling temp file first.
+    A reader either sees the previous complete file or the new complete one.
+    """
     path = _to_path(path).with_suffix(".yaml")
-    with Path.open(path, "w") as file:
-        yaml.safe_dump(data.model_dump(), file)
+    tmp_file = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_file.open("w", encoding="utf-8") as file:
+            yaml.safe_dump(data.model_dump(), file)
+        tmp_file.replace(path)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink()
     return path
 
 
@@ -311,22 +321,7 @@ def _move_optimizer_state_to_device(optimizer: Any, device: str) -> None:
                 state[key] = value.to(device)
 
 
-def restore_training_component_states(
-    snapshot: StateDict,
-    *,
-    optimizer: Any | None = None,
-    scheduler: Any | None = None,
-    grad_scaler: Any | None = None,
-    optimizer_device: str | None = None,
-) -> None:
-    if optimizer and snapshot.get("OPTIMIZER") is not None:
-        optimizer.load_state_dict(snapshot["OPTIMIZER"])
-        if optimizer_device:
-            _move_optimizer_state_to_device(optimizer, optimizer_device)
-    if scheduler and snapshot.get("SCHEDULER") is not None:
-        scheduler.load_state_dict(snapshot["SCHEDULER"])
-    if grad_scaler and snapshot.get("GRAD_SCALER") is not None:
-        grad_scaler.load_state_dict(snapshot["GRAD_SCALER"])
+_COMPONENT_KEYS = ("MODEL", "OPTIMIZER", "SCHEDULER", "GRAD_SCALER")
 
 
 @torch.no_grad()
@@ -334,24 +329,62 @@ def load_training_checkpoint_state(
     checkpoint_file: str | Path,
     model: _TModule,
     *,
-    optimizer: Any | None = None,
-    scheduler: Any | None = None,
-    grad_scaler: Any | None = None,
+    optimizer: Any,
+    scheduler: Any,
+    grad_scaler: Any,
+    gradient_accumulate_every: int,
     map_location: MAP_LOCATION | None = None,
     optimizer_device: str | None = None,
-) -> tuple[_TModule, float, StateDict]:
+) -> tuple[CheckpointCursor, float | None]:
     """
-    Restore a model and, when present, optimizer/scheduler/scaler state.
+    Restore a complete training checkpoint into the objects of the running
+    process.
+
+    A checkpoint is only usable as a resume point when every component of the
+    training state is present and is accepted by the object it belongs to; a
+    model-only file is not a training checkpoint, and there is no fallback to a
+    partial restore. Failures are reported with the checkpoint path so the
+    caller can name the file it rejected.
+
+    Returns:
+        cursor (CheckpointCursor): The position the checkpoint was written at
+        loss (float | None): The historical loss stored alongside it, if any
     """
-    snapshot = load_checkpoint_snapshot(checkpoint_file, map_location=map_location)
-    model.load_state_dict(snapshot["MODEL"], strict=True)
+    try:
+        snapshot = load_checkpoint_snapshot(checkpoint_file, map_location=map_location)
+    except Exception as error:
+        raise ValueError(f"checkpoint {checkpoint_file} cannot be read: {error}") from error
 
-    restore_training_component_states(
-        snapshot,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        grad_scaler=grad_scaler,
-        optimizer_device=optimizer_device,
-    )
+    missing = [key for key in _COMPONENT_KEYS if snapshot.get(key) is None]
+    if missing:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} is not a complete training checkpoint, "
+            f"missing: {', '.join(missing)}"
+        )
 
-    return model, snapshot["LOSS"], snapshot
+    try:
+        cursor = read_checkpoint_cursor(snapshot)
+    except ValueError as error:
+        raise ValueError(f"checkpoint {checkpoint_file} has no usable cursor: {error}") from error
+    if cursor.cum_batch % gradient_accumulate_every != 0:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} sits at cumulative micro-batch {cursor.cum_batch}, "
+            f"which is not a multiple of gradient_accumulate_every "
+            f"({gradient_accumulate_every})"
+        )
+
+    try:
+        model.load_state_dict(snapshot["MODEL"], strict=True)
+        optimizer.load_state_dict(snapshot["OPTIMIZER"])
+        scheduler.load_state_dict(snapshot["SCHEDULER"])
+        grad_scaler.load_state_dict(snapshot["GRAD_SCALER"])
+    except Exception as error:
+        raise ValueError(
+            f"checkpoint {checkpoint_file} does not match this run: {type(error).__name__}: {error}"
+        ) from error
+
+    if optimizer_device:
+        _move_optimizer_state_to_device(optimizer, optimizer_device)
+
+    loss = snapshot.get("LOSS")
+    return cursor, None if loss is None else float(loss)
