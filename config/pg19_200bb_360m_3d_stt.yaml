@@ -37,7 +37,7 @@ params:
       use_flash_attn: true
       pos_emb_type: fixed
 train:
-  target_elements: 200_000_000_000
+  target_elements: 199_917_305_856
   target_elements_strategy: sequence
   batch_size: 1
   shuffle_train: false

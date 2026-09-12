@@ -23,7 +23,11 @@ from mblm.train.core.config import (
 from mblm.train.core.startup import start_trainer
 from mblm.train.core.trainer import CoreTrainer, CoreTrainerOptions
 from mblm.utils.distributed import ElasticRunVars
-from mblm.utils.io import CheckpointCursor, load_checkpoint_snapshot
+from mblm.utils.io import (
+    CheckpointCursor,
+    load_checkpoint_snapshot,
+    load_training_checkpoint_state,
+)
 
 
 class RecordingLogger:
@@ -99,12 +103,25 @@ class FakeLoader:
         return iter([torch.full((1,), 0.0) for _ in range(self._batches)])
 
 
+class CountingSGD(torch.optim.SGD):
+    """SGD that appends to `steps` every time the run takes an optimizer step."""
+
+    def __init__(self, parameters: Iterator[torch.nn.Parameter], steps: list[int]) -> None:
+        super().__init__(parameters, lr=0.1)
+        self._steps = steps
+
+    def step(self, closure: Any = None) -> Any:
+        self._steps.append(1)
+        return super().step(closure)
+
+
 def entry_config(
     tmp_path: Path,
     *,
     target_elements: int,
     log_train_loss_amount: int,
     resume: ResumeConfig | None = None,
+    gradient_accumulate_every: int = 1,
 ) -> TinyEntryConfig:
     return TinyEntryConfig(
         params=TinyParams(input_seq_len=1),
@@ -113,7 +130,7 @@ def entry_config(
             target_elements_strategy="batch",
             batch_size=1,
             learning_rate=0.1,
-            gradient_accumulate_every=1,
+            gradient_accumulate_every=gradient_accumulate_every,
         ),
         io=CoreIoConfig(
             name_model="cursor",
@@ -138,6 +155,7 @@ class CursorHarness:
     ) -> None:
         self.log = RecordingLogger()
         self.forward_batches = 0
+        self.optimizer_steps: list[int] = []
         self.dataset = FakeDataset()
         loader = FakeLoader(batches=loader_batches)
 
@@ -148,6 +166,11 @@ class CursorHarness:
             return model(batch.to(device)).sum()
 
         mocker.patch.object(TinyTrainer, "configure_logger", lambda _self, *_a, **_kw: self.log)
+        mocker.patch.object(
+            TinyTrainer,
+            "configure_optimizer",
+            lambda _self, parameters: CountingSGD(parameters, self.optimizer_steps),
+        )
         mocker.patch.object(TinyTrainer, "_init_distributed_model", lambda _self, model: model)
         mocker.patch.object(
             TinyTrainer, "get_train_dataloader", lambda _self, _dataset, **_kwargs: loader
@@ -295,3 +318,67 @@ class TestAResumedRunContinuesTheCursor:
         assert "Remaining batch iterations: 0" in harness.log.infos
         assert "Finished training" in harness.log.infos
         assert harness.log.fatals == []
+
+
+class TestAnAccumulationWindowSpansEpochBoundaries:
+    def test_a_window_that_crosses_an_epoch_still_takes_one_optimizer_step(
+        self, mocker: MockerFixture, tmp_path: Path
+    ):
+        # four micro-batches in epochs of three: the second window opens on the
+        # last micro-batch of epoch 0 and closes on the first micro-batch of
+        # epoch 1, and the epoch boundary itself takes no step
+        harness = CursorHarness(
+            mocker,
+            entry_config(
+                tmp_path,
+                target_elements=4,
+                log_train_loss_amount=4,
+                gradient_accumulate_every=2,
+            ),
+            loader_batches=3,
+        )
+
+        harness.train()
+
+        assert harness.forward_batches == 4
+        assert harness.optimizer_steps == [1, 1]
+        assert [(row["epoch"], row["batch"]) for row in harness.loss_rows()] == [
+            ("0", "0"),
+            ("0", "1"),
+            ("0", "2"),
+            ("1", "0"),
+        ]
+
+
+class TestAWholeWindowRunSavesAResumePoint:
+    def test_the_checkpoint_of_a_divisible_run_loads_back_as_a_resume_point(
+        self, mocker: MockerFixture, tmp_path: Path
+    ):
+        harness = CursorHarness(
+            mocker,
+            entry_config(
+                tmp_path,
+                target_elements=6,
+                log_train_loss_amount=6,
+                gradient_accumulate_every=2,
+            ),
+            loader_batches=2,
+        )
+
+        harness.train()
+
+        # six micro-batches fill three whole windows, so the run ends on an
+        # accumulation boundary with no window left pending
+        assert harness.optimizer_steps == [1, 1, 1]
+        snapshot = harness.latest_snapshot()
+        assert snapshot["CUM_BATCH"] == 6
+
+        cursor, _ = load_training_checkpoint_state(
+            harness.trainer.output_dir / "latest.pth",
+            harness.trainer._model,
+            optimizer=harness.trainer._optimizer,
+            scheduler=harness.trainer._scheduler,
+            grad_scaler=harness.trainer._grad_scaler,
+            gradient_accumulate_every=2,
+        )
+        assert cursor == CheckpointCursor(epoch=3, batch=0, cum_batch=6)

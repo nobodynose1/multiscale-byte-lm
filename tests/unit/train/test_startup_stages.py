@@ -294,6 +294,42 @@ class TestStartupStageOrder:
         assert "create_output_dir" not in trainer.calls
         assert not (tmp_path / "runs").exists()
 
+    def test_micro_batches_fewer_than_one_accumulation_window_stop_the_run(
+        self, mocker: MockerFixture, tmp_path: Path
+    ):
+        log = RecordingLogger()
+        mocker.patch.object(startup_module, "_log", log)
+        trainer = build_trainer(mocker, tmp_path, target_elements=1, gradient_accumulate_every=2)
+
+        with pytest.raises(SystemExit) as exit_info:
+            start_trainer(trainer, world_size=1)
+
+        assert exit_info.value.code == 1
+        assert log.fatals == [
+            "startup stage 'components' failed: ValueError: the run's 1 micro-batches are fewer "
+            "than gradient_accumulate_every (2): no optimizer step would be taken"
+        ]
+        assert "create_output_dir" not in trainer.calls
+
+    def test_a_run_with_no_micro_batch_at_all_stops_before_it_starts(
+        self, mocker: MockerFixture, tmp_path: Path
+    ):
+        log = RecordingLogger()
+        mocker.patch.object(startup_module, "_log", log)
+        # nothing to train on: the run has to be refused here rather than started
+        # and then end without a single optimizer step
+        trainer = build_trainer(mocker, tmp_path, target_elements=0, gradient_accumulate_every=1)
+
+        with pytest.raises(SystemExit) as exit_info:
+            start_trainer(trainer, world_size=1)
+
+        assert exit_info.value.code == 1
+        assert log.fatals == [
+            "startup stage 'components' failed: ValueError: the run's 0 micro-batches are fewer "
+            "than gradient_accumulate_every (1): no optimizer step would be taken"
+        ]
+        assert not (tmp_path / "runs").exists()
+
 
 class TestNoArtefactBeforeTheOutputStage:
     def test_nothing_exists_while_the_components_are_built(

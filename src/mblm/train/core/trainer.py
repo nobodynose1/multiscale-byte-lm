@@ -344,6 +344,11 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
 
         accumulation = self.config.train.gradient_accumulate_every
         batch_iters = self.local_batch_iters()
+        if batch_iters < accumulation:
+            raise ValueError(
+                f"the run's {batch_iters} micro-batches are fewer than "
+                f"gradient_accumulate_every ({accumulation}): no optimizer step would be taken"
+            )
         if batch_iters % accumulation != 0:
             raise ValueError(
                 f"the run's {batch_iters} micro-batches are not a multiple of "

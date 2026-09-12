@@ -39,7 +39,7 @@ params:
     mamba_backend: mamba2
     pos_emb_type: null
 train:
-  target_elements: 7_000_000
+  target_elements: 6_999_552
   target_elements_strategy: batch
   batch_size: 6
   max_eval_steps: 1000
