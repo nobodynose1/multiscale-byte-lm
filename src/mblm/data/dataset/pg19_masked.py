@@ -23,7 +23,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
 
-import pathlib
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Generator
@@ -34,7 +33,7 @@ from typing_extensions import Unpack
 
 from mblm.data.datasets import DistributedDataset, DistributedDatasetConfig
 from mblm.data.types import BatchMaskedForMLM, ModelMode
-from mblm.data.utils import Bytes
+from mblm.data.utils import Bytes, ordered_name_size_sha256, sorted_dir_entries
 
 if TYPE_CHECKING:
     from mblm.train.mblm import TrainMaskedEntryConfig
@@ -73,7 +72,8 @@ class PG19Masked(DistributedDataset[BatchMaskedForMLM]):
             data_path = root / "validation"
         else:
             data_path = root / mode.value
-        self.txt_files = [file for file in pathlib.Path.iterdir(data_path)]
+        self.txt_files = sorted_dir_entries(data_path)
+        self._data_lineage = ordered_name_size_sha256(self.txt_files)
         self.masking_proba = masking_proba
         data_buff = bytearray()
         for file in tqdm.tqdm(
@@ -117,6 +117,12 @@ class PG19Masked(DistributedDataset[BatchMaskedForMLM]):
     @staticmethod
     def supports_test_mode() -> bool:
         return True
+
+    def data_lineage(self) -> str | None:
+        """
+        The books this dataset concatenated, in the order it read them.
+        """
+        return self._data_lineage
 
     def get_sample(self, from_idx: int) -> BatchMaskedForMLM:
         """

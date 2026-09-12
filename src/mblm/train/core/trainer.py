@@ -45,6 +45,7 @@ from mblm.model.utils import count_params
 from mblm.train.core.config import (
     CSVLossEntry,
     CSVTimeAndMemSnapshotEntry,
+    DataLineage,
     GenericEntryConfig,
     GenericOutputConfig,
     ResumeMetadata,
@@ -132,6 +133,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
     # misc - attached once the run owns an output directory
     _output_dir: Path | None
     _resume_metadata: ResumeMetadata
+    _data_lineage: DataLineage | None
     _running_summary_stats: SummaryStats
     _top_n_models: TopN[StateDict]
     _csv_loss_writer: CSVWriter[CSVLossEntry]
@@ -157,6 +159,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         self.config = config
         self.options = options or CoreTrainerOptions()
         self._resume_cursor = None
+        self._data_lineage = None
         self._last_latest_checkpoint_step = 0
         self._last_latest_checkpoint_time = time()
         self._world_size = run_vars.world_size
@@ -277,6 +280,13 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
         output_dir = Path(self.config.io.output_dir) / f"{self.config.io.name_model}_{run_id}"
         output_dir.mkdir(parents=True, exist_ok=False)
         return str(output_dir)
+
+    def record_data_lineage(self, lineage: DataLineage) -> None:
+        """
+        Record what the run actually read, so the output config can attest it.
+        The record is an audit trail: it is not read back and it gates nothing.
+        """
+        self._data_lineage = lineage
 
     def initialize_outputs(self, output_dir: str) -> None:
         """
@@ -494,6 +504,7 @@ class CoreTrainer(ABC, Generic[TModel, TBatch, TModelParams, TTrainConfig, TIoCo
             train=self.config.train,
             resume=self._resume_metadata,
             summary=self._running_summary_stats,
+            data_lineage=self._data_lineage,
         )
         dump_yml(self.output_dir / self.options.config_file_name, output_config)
 

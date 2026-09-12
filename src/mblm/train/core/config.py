@@ -143,6 +143,26 @@ class ResumeMetadata(BaseModel):
     )
 
 
+class DataLineage(BaseModel):
+    """
+    The output-side record of what a run actually read, as the code enumerated
+    it. Like `ResumeMetadata` this is an audit trail: it is written to the
+    output config, never accepted as an input, and never gates a run.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    enumeration: str = Field(
+        description="The enumeration rule the code applied to the run's input directories"
+    )
+    train: str | None = Field(
+        description="Digest of the training inputs in read order, or `None` when the training dataset does not read its input by enumerating a directory (not applicable, not uncollected)"
+    )
+    validation: str | None = Field(
+        description="Digest of the validation inputs in read order, or `None` when the validation dataset does not read its input by enumerating a directory (not applicable, not uncollected)"
+    )
+
+
 class CoreIoConfig(BaseModel):
     """
     The core input/output parameters needed for a training run with the
@@ -209,6 +229,7 @@ class GenericOutputConfig(BaseModel, Generic[TModelParams, TTrainConfig, TIoConf
     io: TIoConfig
     resume: ResumeMetadata
     summary: SummaryStats
+    data_lineage: DataLineage | None = None
 
 
 class CSVLossEntry(NamedTuple):

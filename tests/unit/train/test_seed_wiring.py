@@ -149,6 +149,9 @@ def run_entry(
             calls.append("trainer")
             self.output_dir = "unused"
 
+        def record_data_lineage(self, _lineage: Any) -> None:
+            pass
+
         def train(self, _train_dataset: Any, _valid_dataset: Any) -> None:
             calls.append("train")
 
@@ -156,11 +159,15 @@ def run_entry(
         @staticmethod
         def from_train_entry_config(*_args: Any, mode: ModelMode, **_kwargs: Any) -> object:
             calls.append(f"dataset:{mode.value}")
-            return object()
+            return DatasetStub()
 
         @staticmethod
         def supports_test_mode() -> bool:
             return False
+
+        @staticmethod
+        def data_lineage() -> None:
+            return None
 
     mocker.patch.object(
         train_module, "create_logger", lambda *_args, **_kwargs: RecordingLogger(messages)

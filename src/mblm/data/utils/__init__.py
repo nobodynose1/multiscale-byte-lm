@@ -22,7 +22,13 @@ SOFTWARE."""
 
 from .bytes import Bytes, FileStream
 from .image import BinMode, ColorSpace, ImagePipeline
-from .misc import shift_remap_tensor, target_loss_mask
+from .misc import (
+    DATA_ENUMERATION_VERSION,
+    ordered_name_size_sha256,
+    shift_remap_tensor,
+    sorted_dir_entries,
+    target_loss_mask,
+)
 from .tokenizer import Tokenizer, TokenizerOptions
 
 __all__ = [
@@ -35,4 +41,7 @@ __all__ = [
     "target_loss_mask",
     "shift_remap_tensor",
     "FileStream",
+    "DATA_ENUMERATION_VERSION",
+    "sorted_dir_entries",
+    "ordered_name_size_sha256",
 ]

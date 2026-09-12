@@ -121,11 +121,15 @@ def process_group_stub(**_kwargs: Any) -> Iterator[ElasticRunVars]:
 class DatasetStub:
     @staticmethod
     def from_train_entry_config(*_args: Any, **_kwargs: Any) -> object:
-        return object()
+        return DatasetStub()
 
     @staticmethod
     def supports_test_mode() -> bool:
         return True
+
+    @staticmethod
+    def data_lineage() -> None:
+        return None
 
 
 class FailingTrainerStub:
@@ -133,6 +137,9 @@ class FailingTrainerStub:
 
     def __init__(self, _config: Any, **_kwargs: Any) -> None:
         self.output_dir = "unused"
+
+    def record_data_lineage(self, _lineage: Any) -> None:
+        pass
 
     def train(self, *_args: Any, **_kwargs: Any) -> None:
         raise TrainingError("the training loop failed")

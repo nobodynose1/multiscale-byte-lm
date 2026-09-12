@@ -166,6 +166,9 @@ class EntryHarness:
                 calls.append("trainer")
                 self.output_dir = "unused"
 
+            def record_data_lineage(self, _lineage: Any) -> None:
+                pass
+
             def train(self, *_args: Any, **_kwargs: Any) -> None:
                 calls.append("train")
 
@@ -175,11 +178,15 @@ class EntryHarness:
                 calls.append(f"dataset:{mode.value}")
                 if self._fail_dataset_build and mode is ModelMode.TRAIN:
                     raise RuntimeError("the dataset cannot be read")
-                return object()
+                return DatasetStub()
 
             @staticmethod
             def supports_test_mode() -> bool:
                 return False
+
+            @staticmethod
+            def data_lineage() -> None:
+                return None
 
         def fake_start_trainer(*_args: Any, **_kwargs: Any) -> None:
             calls.append("startup")

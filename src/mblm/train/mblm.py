@@ -37,6 +37,7 @@ from mblm.data.dataset.pg19 import PG19
 from mblm.data.dataset.pg19_masked import PG19Masked
 from mblm.data.datasets import DistributedDataset
 from mblm.data.types import BatchMaskedForMLM, BatchWithLossMask, ModelMode
+from mblm.data.utils import DATA_ENUMERATION_VERSION
 from mblm.model.config import MBLMEncoderModelConfig, MBLMModelConfig, MBLMReturnType
 from mblm.model.mamba_admission import run_mamba_admission, write_mamba_impl_marker
 from mblm.model.mblm import MBLM, MBLMEncoder
@@ -45,6 +46,7 @@ from mblm.train.core.config import (
     CoreIoConfig,
     CoreModelParams,
     CoreTrainConfig,
+    DataLineage,
     GenericEntryConfig,
     GenericOutputConfig,
     TrainMaskedConfig,
@@ -328,6 +330,13 @@ def train_encoder_mblm(config: TrainMaskedEntryConfig) -> None:
                     num_workers=1,
                 )
             trainer = MaskedTrainer(config, run_vars=run_vars)
+            trainer.record_data_lineage(
+                DataLineage(
+                    enumeration=DATA_ENUMERATION_VERSION,
+                    train=train_dataset.data_lineage(),
+                    validation=eval_dataset.data_lineage(),
+                )
+            )
             start_trainer(trainer, world_size=run_vars.world_size)
             if run_vars.global_rank == 0:
                 write_mamba_impl_marker(trainer.output_dir, admission)
@@ -377,6 +386,13 @@ def train_mblm(config: TrainEntryConfig) -> None:
                 )
 
             trainer = MegabyteTrainer(config, run_vars=run_vars)
+            trainer.record_data_lineage(
+                DataLineage(
+                    enumeration=DATA_ENUMERATION_VERSION,
+                    train=train_dataset.data_lineage(),
+                    validation=valid_dataset.data_lineage(),
+                )
+            )
             start_trainer(trainer, world_size=run_vars.world_size)
             if run_vars.global_rank == 0:
                 write_mamba_impl_marker(trainer.output_dir, admission)

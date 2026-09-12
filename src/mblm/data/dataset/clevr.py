@@ -23,7 +23,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
 import json
-import os
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Generator, Literal, TypedDict, overload
@@ -41,6 +40,7 @@ from mblm.data.utils import (
     Tokenizer,
     TokenizerOptions,
     shift_remap_tensor,
+    sorted_dir_entries,
     target_loss_mask,
 )
 
@@ -297,13 +297,13 @@ class Clevr(DistributedDataset[BatchWithLossMask]):
         this iterator if you want to iterate over images and yield a unique
         image each time. No preprocessing is applied.
         """
-        image_lst = os.listdir(self.images_root)
+        image_lst = sorted_dir_entries(self.images_root)
         if shuffle:
             random.shuffle(image_lst)
         if max_items is not None:
             image_lst = image_lst[:max_items]
         for img_path in image_lst:
-            yield ImagePipeline(self.images_root / img_path, self.image_color_space).to_tensor()
+            yield ImagePipeline(img_path, self.image_color_space).to_tensor()
 
     @overload
     def iter(

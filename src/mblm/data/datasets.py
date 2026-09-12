@@ -98,6 +98,15 @@ class DistributedDataset(ABC, Dataset[_T]):
         self.seq_len = seq_len
         self.sample_offset = 0
 
+    def data_lineage(self) -> str | None:
+        """
+        A digest of the inputs this dataset reads, in the order it reads them,
+        or `None` when it does not read its input by enumerating a directory.
+        A dataset that does not enumerate is not a gap in the audit: `None` means
+        not applicable, not uncollected.
+        """
+        return None
+
     def offset_to(self, offset: int) -> DistributedDataset[_T]:
         """
         Offset for sequential sampling - has no effect if this `is_sequential`
