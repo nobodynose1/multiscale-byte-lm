@@ -82,6 +82,44 @@ class TestCSVWriter:
                     # Order may differ due to concurrent writing
                     assert list(map(str, range(10))) == sorted(indexes)
 
+    def test_a_leftover_file_is_archived_before_the_new_one_starts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_output_dir = Path(tmpdir)
+            (temp_output_dir / "test.csv").write_text(
+                "kind,idx,time\nold,1,2026\n", encoding="utf-8"
+            )
+
+            csv_writer = CSVWriter[DummyCSVEntry](output_dir=temp_output_dir, file_name="test")
+            csv_writer.write_row(DummyCSVEntry(kind="test", idx=0, time="now"))
+
+            archived = list(temp_output_dir.glob("test.csv.*.bak"))
+            assert len(archived) == 1
+            assert archived[0].read_text(encoding="utf-8") == "kind,idx,time\nold,1,2026\n"
+            with (temp_output_dir / "test.csv").open("r", encoding="utf-8") as f:
+                reader = list(csv.reader(f))
+            assert reader[0] == list(DummyCSVEntry._fields)
+            assert len(reader) == 2
+
+    def test_an_empty_leftover_file_is_not_archived(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_output_dir = Path(tmpdir)
+            (temp_output_dir / "test.csv").write_text("", encoding="utf-8")
+
+            CSVWriter[DummyCSVEntry](output_dir=temp_output_dir, file_name="test")
+
+            assert list(temp_output_dir.glob("*.bak")) == []
+
+    def test_two_reuses_leave_two_distinct_archives(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_output_dir = Path(tmpdir)
+            for _ in range(2):
+                (temp_output_dir / "test.csv").write_text("old\n", encoding="utf-8")
+                CSVWriter[DummyCSVEntry](output_dir=temp_output_dir, file_name="test")
+
+            archived = list(temp_output_dir.glob("test.csv.*.bak"))
+            assert len({path.name for path in archived}) == 2
+            assert [path.read_text(encoding="utf-8") for path in archived] == ["old\n", "old\n"]
+
 
 class TestCheckpointCursor:
     def test_a_written_cursor_is_read_back_from_the_checkpoint(self):

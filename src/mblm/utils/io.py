@@ -25,8 +25,10 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Generic, NamedTuple, TypeAlias, TypeVar
+from uuid import uuid4
 
 import torch
 import yaml
@@ -114,11 +116,20 @@ class CSVWriter(Generic[_TNamedTuple]):
         output_dir = _to_path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self._file = (output_dir / file_name).with_suffix(".csv")
+        self._archive_leftover_file()
 
         with self._file.open("w", encoding="utf-8"):
             # clear existing file contents
             pass
         self._lock = FileLock(str(self._file) + ".lock")
+
+    def _archive_leftover_file(self) -> None:
+        """Move a leftover file aside so reusing a directory never loses it."""
+        if not self._file.exists() or self._file.stat().st_size == 0:
+            return
+        stamp = datetime.now().strftime("%Y%m%dT%H%M")
+        archive = self._file.with_name(f"{self._file.name}.{stamp}-{uuid4().hex[:8]}.bak")
+        self._file.rename(archive)
 
     def _file_is_empty(self) -> bool:
         """Check if the file is empty."""
