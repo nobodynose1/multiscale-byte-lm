@@ -1,7 +1,7 @@
 io:
   name_model: 8k_30b_360m_1d_s
-  output_dir: /data/output < set this!
-  dataset_dir: /data/datasets/pg19 < set this!
+  output_dir: /data/students/mai_songlang/mblm-cbqa/runs
+  dataset_dir: /data/students/mai_songlang/mblm-cbqa/data/pg19
   dataset_id: pg19
   num_models_to_save: 5
   validate_amount: 100
