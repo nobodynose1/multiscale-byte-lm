@@ -4,8 +4,6 @@ io:
   num_models_to_save: 0
   validate_amount: 10
   log_train_loss_amount: 20
-  description: >-
-    This is config 1 to test gradient accumulation
 params:
   input_seq_len: 1
   hidden_size: 20

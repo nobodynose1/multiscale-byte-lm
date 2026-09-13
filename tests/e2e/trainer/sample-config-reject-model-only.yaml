@@ -1,0 +1,18 @@
+io:
+  name_model: rejected-model-only
+  output_dir: tests/e2e/trainer/outputs
+  num_models_to_save: 0
+  validate_amount: 1
+  log_train_loss_amount: 1
+params:
+  input_seq_len: 1
+  hidden_size: 20
+  output_size: 1
+train:
+  target_elements: 10_240
+  batch_size: 8
+  learning_rate: 0.001
+  gradient_accumulate_every: 10
+  target_elements_strategy: batch
+resume:
+  checkpoint_file: tests/e2e/trainer/outputs/my-model_1/my-model_top1.pth

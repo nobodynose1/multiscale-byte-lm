@@ -87,6 +87,7 @@ E2E_RUN_TORCH = OMP_NUM_THREADS=1 \
 	tests/e2e/trainer/run_trainer.py
 E2E_RUN_VALIDATE = uv run tests/e2e/trainer/validate.py
 E2E_MAKE_RESUME = uv run tests/e2e/trainer/make_resume_config.py
+E2E_MAKE_INVALID_CHECKPOINT = uv run tests/e2e/trainer/make_invalid_checkpoint.py
 E2E_TEST_ROOT = tests/e2e/trainer
 E2E_RESUME_CONFIGS = $(E2E_TEST_ROOT)/outputs/resume-configs
 
@@ -96,6 +97,7 @@ test_e2e:
 	rm -rf $(E2E_TEST_ROOT)/outputs/*
 	$(MAKE) test_e2e_grad_acc
 	$(MAKE) test_e2e_trainer
+	$(MAKE) test_e2e_negative_resume
 
 .PHONY: test_e2e_grad_acc
 test_e2e_grad_acc:
@@ -115,6 +117,7 @@ test_e2e_trainer:
 	@echo "Chaining run 2 to run 1"
 	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1-epoch.yaml \
 		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_1/latest.pth \
+		--target-elements 20480 \
 		--out $(E2E_RESUME_CONFIGS)/my-model_2.yaml
 	TEST_ID=2 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_2.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_2
@@ -122,6 +125,7 @@ test_e2e_trainer:
 	@echo "Chaining run 3 to run 2"
 	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1-epoch.yaml \
 		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_2/latest.pth \
+		--target-elements 30720 \
 		--out $(E2E_RESUME_CONFIGS)/my-model_3.yaml
 	TEST_ID=3 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_3.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_3
@@ -132,6 +136,10 @@ test_e2e_trainer:
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_1/loss.csv \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_2/loss.csv \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_3/loss.csv
+	$(E2E_RUN_VALIDATE) \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_1 \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_2 \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_3
 
 	# ------------ Chain 2 runs of more than 1 epoch each ------------
 	@echo "Running training for more than 1 epoch"
@@ -141,6 +149,7 @@ test_e2e_trainer:
 	@echo "Chaining run 5 to run 4"
 	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-1.5-epoch.yaml \
 		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_4/latest.pth \
+		--target-elements 33280 \
 		--out $(E2E_RESUME_CONFIGS)/my-model_5.yaml
 	TEST_ID=5 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_5.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_5
@@ -149,6 +158,9 @@ test_e2e_trainer:
 	$(E2E_RUN_VALIDATE) \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_4/loss.csv \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_5/loss.csv
+	$(E2E_RUN_VALIDATE) \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_4 \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_5
 
 	# ------------ Chain 2 runs of less than 1 epoch each ------------
 	@echo "Running training for less than 1 epoch"
@@ -158,6 +170,7 @@ test_e2e_trainer:
 	@echo "Chaining run 7 to run 6"
 	$(E2E_MAKE_RESUME) --base $(E2E_TEST_ROOT)/sample-config-0.5-epoch.yaml \
 		--checkpoint $(E2E_TEST_ROOT)/outputs/my-model_6/latest.pth \
+		--target-elements 11520 \
 		--out $(E2E_RESUME_CONFIGS)/my-model_7.yaml
 	TEST_ID=7 $(E2E_RUN_TORCH) -c $(E2E_RESUME_CONFIGS)/my-model_7.yaml
 	$(E2E_RUN_VALIDATE) --check-output $(E2E_TEST_ROOT)/outputs/my-model_7
@@ -166,6 +179,24 @@ test_e2e_trainer:
 	$(E2E_RUN_VALIDATE) \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_6/loss.csv \
 		--check-chained-csv $(E2E_TEST_ROOT)/outputs/my-model_7/loss.csv
+	$(E2E_RUN_VALIDATE) \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_6 \
+		--check-resume-chain $(E2E_TEST_ROOT)/outputs/my-model_7
+
+.PHONY: test_e2e_negative_resume
+test_e2e_negative_resume:
+	$(E2E_MAKE_INVALID_CHECKPOINT) \
+		--source $(E2E_TEST_ROOT)/outputs/my-model_1/latest.pth \
+		--out $(E2E_TEST_ROOT)/outputs/invalid-cum-batch.pth
+	@if TEST_ID=negative-auto $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/sample-config-reject-auto-resume.yaml; then echo "expected auto-resume config rejection"; exit 1; fi
+	@test ! -e $(E2E_TEST_ROOT)/outputs/rejected-auto-resume_negative-auto
+	@if TEST_ID=negative-missing $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/sample-config-reject-missing-checkpoint.yaml; then echo "expected missing checkpoint rejection"; exit 1; fi
+	@test ! -e $(E2E_TEST_ROOT)/outputs/rejected-missing-checkpoint_negative-missing
+	@if TEST_ID=negative-model-only $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/sample-config-reject-model-only.yaml; then echo "expected model-only checkpoint rejection"; exit 1; fi
+	@test ! -e $(E2E_TEST_ROOT)/outputs/rejected-model-only_negative-model-only
+	@if TEST_ID=negative-misaligned $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/sample-config-reject-misaligned-checkpoint.yaml; then echo "expected misaligned checkpoint rejection"; exit 1; fi
+	@test ! -e $(E2E_TEST_ROOT)/outputs/rejected-misaligned-checkpoint_negative-misaligned
+	@if TEST_ID=negative-eval-error TEST_INJECT_EVAL_ERROR_RANK=0 TEST_INJECT_EVAL_ERROR_AFTER_FORWARD=11 $(E2E_RUN_TORCH) -c $(E2E_TEST_ROOT)/sample-config-reject-eval-error.yaml; then echo "expected evaluation failure propagation"; exit 1; fi
 
 .PHONY: clear_cache
 clear_cache:

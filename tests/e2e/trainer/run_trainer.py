@@ -107,6 +107,13 @@ class TestTrainer(CoreTrainer[SimpleNN, TBatch, ModelParams, CoreTrainConfig, Co
         # assert_type(model, SimpleNN)
         # assert_type(batch, BatchType)
         # assert_type(device, str)
+        injected_rank = os.environ.get("TEST_INJECT_EVAL_ERROR_RANK")
+        injected_after = os.environ.get("TEST_INJECT_EVAL_ERROR_AFTER_FORWARD")
+        if injected_rank is not None and injected_after is not None:
+            calls = getattr(self, "_test_forward_calls", 0) + 1
+            self._test_forward_calls = calls
+            if torch.distributed.get_rank() == int(injected_rank) and calls == int(injected_after):
+                raise RuntimeError("injected e2e evaluation error")
         x, y = batch
         output = model.forward(x.to(device))
         loss_function = torch.nn.MSELoss()

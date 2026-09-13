@@ -10,7 +10,7 @@ params:
   output_size: 1
 train:
   # There are 10_000 elements in the training set
-  target_elements: 5_870
+  target_elements: 5_760
   batch_size: 8
   shuffle_train: true
   learning_rate: 0.001

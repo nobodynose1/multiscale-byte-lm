@@ -10,7 +10,7 @@ params:
   output_size: 1
 train:
   # There are 10_000 elements in the training set
-  target_elements: 10_000
+  target_elements: 10_240
   batch_size: 8
   learning_rate: 0.001
   gradient_clipping: 0.5
