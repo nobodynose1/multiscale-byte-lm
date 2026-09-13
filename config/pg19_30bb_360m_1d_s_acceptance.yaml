@@ -1,0 +1,47 @@
+# Two-GPU PG19 1D-S/Mamba2 acceptance run.  This is an isolated diagnostic
+# input, not a replacement for pg19_30bb_360m_1d_s.yaml or a formal result.
+io:
+  name_model: 8k_30b_360m_1d_s_acceptance
+  output_dir: /data/students/mai_songlang/mblm-cbqa/runs
+  dataset_dir: /data/students/mai_songlang/mblm-cbqa/data/pg19
+  dataset_id: pg19
+  # Keep one ranked checkpoint to exercise validation/candidate delivery,
+  # while avoiding the five-copy retention of the formal experiment.
+  num_models_to_save: 1
+  validate_amount: 3
+  # 240 local micro-batches produces loss records every optimizer step.
+  log_train_loss_amount: 10
+params:
+  num_tokens: 256
+  pad_token_id: 0
+  input_seq_len: 8192
+  seq_lens: [8192]
+  hidden_dims: [1024]
+  num_layers: [54]
+  train_checkpoint_chunks: null
+  block:
+    block_type: mamba2
+    d_state: 128
+    d_conv: 4
+    expand: 2
+    headdim: 64
+    dropout: 0
+    mamba_backend: mamba2
+    pos_emb_type: null
+train:
+  seed: 42
+  # With 2 ranks: 7,864,320 / 2 / (2 * 8192) = 240 micro-batches
+  # = 10 complete optimizer steps at gradient_accumulate_every=24.
+  target_elements: 7_864_320
+  target_elements_strategy: sequence
+  batch_size: 2
+  shuffle_train: false
+  # Preserve the formal monitoring window; it is deliberately not a full eval.
+  max_eval_steps: 50
+  learning_rate: 0.001
+  gradient_clipping: 1
+  gradient_accumulate_every: 24
+  # A checkpoint after step 5 exercises an in-run safe point; a final checkpoint
+  # is always written after step 10 and is the explicit resume input.
+  latest_checkpoint_enabled: true
+  latest_checkpoint_interval_steps: 5
